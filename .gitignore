@@ -1,0 +1,15 @@
+build/
+release/
+.vs/
+out/
+CMakeUserPresets.json
+
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+*.obj
+*.pdb
+*.ilk
+*.log
