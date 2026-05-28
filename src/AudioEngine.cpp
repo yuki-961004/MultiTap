@@ -538,9 +538,11 @@ void AudioEngine::Worker(std::vector<OutputSelection> selectedDevices, StatusCal
 
         bool packetOk = true;
         float defaultVolume = 1.0f;
-        if (!defaultSelected && defaultEndpointVolume) {
+        if (defaultEndpointVolume) {
             float scalar = 1.0f;
-            if (SUCCEEDED(defaultEndpointVolume->GetMasterVolumeLevelScalar(&scalar))) {
+            if (SUCCEEDED(
+                    defaultEndpointVolume->GetMasterVolumeLevelScalar(
+                        &scalar))) {
                 defaultVolume = std::clamp(scalar, 0.0f, 1.0f);
             }
         }

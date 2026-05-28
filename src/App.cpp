@@ -1,40 +1,55 @@
 #include "AudioEngine.h"
+#include "ComPtr.h"
 #include "Config.h"
 #include "DeviceEnumerator.h"
 
 #include <Windows.h>
 #include <Commctrl.h>
 #include <Dwmapi.h>
+#include <Endpointvolume.h>
+#include <Mmdeviceapi.h>
 #include <Objbase.h>
-#include <Shlwapi.h>
 #include <Uxtheme.h>
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cwctype>
 #include <memory>
 #include <string>
 #include <vector>
 
-#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#pragma comment(linker, "\"/manifestdependency:type='win32' "\
+    "name='Microsoft.Windows.Common-Controls' version='6.0.0.0' "\
+    "processorArchitecture='*' publicKeyToken='6595b64144ccf1df' "\
+    "language='*'\"")
 
 namespace {
+
+// ############################
+// Control IDs
+// ############################
 
 constexpr int kDeviceList = 1001;
 constexpr int kStartButton = 1002;
 constexpr int kStopButton = 1003;
 constexpr int kRefreshButton = 1004;
-constexpr int kVolumeSlider = 1005;
-constexpr int kVolumeLabel = 1006;
-constexpr int kTitleLabel = 1007;
-constexpr int kSubtitleLabel = 1008;
-constexpr int kThemeButton = 1009;
-constexpr int kMinButton = 1010;
-constexpr int kMaxButton = 1011;
-constexpr int kCloseButton = 1012;
+constexpr int kTitleLabel = 1005;
+constexpr int kSubtitleLabel = 1006;
+constexpr int kThemeButton = 1007;
+constexpr int kDeviceHeading = 1008;
+constexpr int kStatusPanel = 1009;
+
 constexpr UINT kStatusMessage = WM_APP + 1;
-constexpr UINT kSliderChangedMessage = WM_APP + 2;
-constexpr int kTitleBarHeight = 44;
-constexpr int kResizeBorder = 8;
+constexpr UINT kVolumeChangedMessage = WM_APP + 2;
+
+constexpr int kDefaultWindowWidth = 640;
+constexpr int kDefaultWindowHeight = 520;
+constexpr int kMinimumWindowWidth = 560;
+constexpr int kMinimumWindowHeight = 420;
+
+constexpr int kDeviceRowHeight = 56;
+constexpr int kDeviceRowGap = 8;
+constexpr int kCardRadius = 8;
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -70,336 +85,544 @@ enum DwmSystemBackdropType {
     kDwmBackdropTabbedWindow = 4
 };
 
+enum class StatusKind {
+    Idle,
+    Running,
+    Error
+};
+
+class EndpointVolumeCallback final : public IAudioEndpointVolumeCallback {
+public:
+    explicit EndpointVolumeCallback(HWND hwnd) : hwnd_(hwnd) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&refCount_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG count = InterlockedDecrement(&refCount_);
+
+        if (count == 0) {
+            delete this;
+        }
+
+        return static_cast<ULONG>(count);
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object)
+        override {
+        if (!object) {
+            return E_POINTER;
+        }
+
+        if (iid == __uuidof(IUnknown) ||
+            iid == __uuidof(IAudioEndpointVolumeCallback)) {
+            *object = static_cast<IAudioEndpointVolumeCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnNotify(
+        PAUDIO_VOLUME_NOTIFICATION_DATA data) override {
+        if (!data || !IsWindow(hwnd_)) {
+            return S_OK;
+        }
+
+        int percent = static_cast<int>(
+            std::clamp(data->fMasterVolume, 0.0f, 1.0f) * 100.0f + 0.5f);
+        PostMessageW(hwnd_, kVolumeChangedMessage,
+            static_cast<WPARAM>(percent), 0);
+        return S_OK;
+    }
+
+private:
+    LONG refCount_ = 1;
+    HWND hwnd_ = nullptr;
+};
+
+class SystemVolumeController {
+public:
+    ~SystemVolumeController() {
+        Close();
+    }
+
+    bool Open(HWND hwnd) {
+        Close();
+        hwnd_ = hwnd;
+
+        ComPtr<IMMDeviceEnumerator> enumerator;
+        HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
+            CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
+            reinterpret_cast<void**>(enumerator.put()));
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        ComPtr<IMMDevice> endpoint;
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole,
+            endpoint.put());
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        hr = endpoint->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+            nullptr, reinterpret_cast<void**>(endpointVolume_.put()));
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        callback_ = new EndpointVolumeCallback(hwnd_);
+        hr = endpointVolume_->RegisterControlChangeNotify(callback_);
+
+        if (FAILED(hr)) {
+            callback_->Release();
+            callback_ = nullptr;
+        }
+
+        return true;
+    }
+
+    void Close() {
+        if (endpointVolume_ && callback_) {
+            endpointVolume_->UnregisterControlChangeNotify(callback_);
+        }
+
+        if (callback_) {
+            callback_->Release();
+            callback_ = nullptr;
+        }
+
+        endpointVolume_.reset();
+        hwnd_ = nullptr;
+    }
+
+    bool GetVolumePercent(int* percent) {
+        if (!endpointVolume_ || !percent) {
+            return false;
+        }
+
+        float scalar = 1.0f;
+        HRESULT hr = endpointVolume_->GetMasterVolumeLevelScalar(&scalar);
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        *percent = static_cast<int>(
+            std::clamp(scalar, 0.0f, 1.0f) * 100.0f + 0.5f);
+        return true;
+    }
+
+    bool SetVolumePercent(int percent) {
+        if (!endpointVolume_) {
+            return false;
+        }
+
+        float scalar = static_cast<float>(
+            std::clamp(percent, 0, 100)) / 100.0f;
+        return SUCCEEDED(
+            endpointVolume_->SetMasterVolumeLevelScalar(scalar, nullptr));
+    }
+
+private:
+    HWND hwnd_ = nullptr;
+    EndpointVolumeCallback* callback_ = nullptr;
+    ComPtr<IAudioEndpointVolume> endpointVolume_;
+};
+
 struct Theme {
-    COLORREF window;
+    COLORREF background;
     COLORREF surface;
+    COLORREF surfaceHover;
     COLORREF text;
-    COLORREF muted;
-    COLORREF accent;
+    COLORREF textMuted;
+    COLORREF textDisabled;
     COLORREF border;
+    COLORREF borderStrong;
+    COLORREF accent;
+    COLORREF accentPressed;
+    COLORREF accentSoft;
     COLORREF button;
     COLORREF buttonPressed;
     COLORREF buttonDisabled;
+    COLORREF warning;
+    COLORREF error;
+    COLORREF ok;
 };
 
 constexpr Theme kLightTheme = {
-    RGB(243, 246, 250),
-    RGB(250, 251, 253),
-    RGB(31, 31, 31),
-    RGB(96, 96, 96),
+    RGB(246, 247, 249),
+    RGB(255, 255, 255),
+    RGB(249, 251, 253),
+    RGB(32, 33, 36),
+    RGB(94, 99, 104),
+    RGB(145, 149, 155),
+    RGB(222, 226, 232),
+    RGB(197, 203, 211),
     RGB(0, 95, 184),
-    RGB(213, 217, 222),
-    RGB(252, 252, 252),
-    RGB(235, 241, 249),
-    RGB(239, 241, 244)
+    RGB(0, 78, 154),
+    RGB(232, 242, 253),
+    RGB(255, 255, 255),
+    RGB(242, 246, 251),
+    RGB(237, 240, 244),
+    RGB(143, 84, 0),
+    RGB(196, 43, 28),
+    RGB(16, 124, 16)
 };
 
 constexpr Theme kDarkTheme = {
-    RGB(32, 32, 32),
-    RGB(44, 44, 44),
+    RGB(31, 32, 35),
+    RGB(43, 44, 48),
+    RGB(51, 53, 58),
     RGB(243, 243, 243),
-    RGB(190, 190, 190),
+    RGB(190, 193, 198),
+    RGB(126, 130, 136),
+    RGB(67, 70, 76),
+    RGB(88, 93, 101),
     RGB(96, 174, 255),
-    RGB(73, 73, 73),
-    RGB(58, 58, 58),
-    RGB(72, 72, 72),
-    RGB(45, 45, 45)
+    RGB(72, 151, 235),
+    RGB(35, 62, 92),
+    RGB(50, 52, 57),
+    RGB(62, 65, 71),
+    RGB(42, 44, 48),
+    RGB(255, 196, 87),
+    RGB(255, 107, 107),
+    RGB(99, 203, 105)
 };
 
 struct AppState {
     HWND hwnd = nullptr;
-    HWND list = nullptr;
+    HWND deviceList = nullptr;
     HWND start = nullptr;
     HWND stop = nullptr;
     HWND refresh = nullptr;
     HWND themeButton = nullptr;
-    HWND minButton = nullptr;
-    HWND maxButton = nullptr;
-    HWND closeButton = nullptr;
     HWND title = nullptr;
     HWND subtitle = nullptr;
-    HWND volumeSlider = nullptr;
-    HWND volumeLabel = nullptr;
-    HWND status = nullptr;
+    HWND deviceHeading = nullptr;
+    HWND statusPanel = nullptr;
+
+    std::unique_ptr<SystemVolumeController> volumeController;
     std::vector<PlaybackDeviceInfo> devices;
-    std::vector<int> volumes;
+    std::vector<bool> selected;
     AudioEngine engine;
+
+    UINT dpi = 96;
     bool dark = false;
-    bool useBackdrop = true;
+    StatusKind statusKind = StatusKind::Idle;
+    std::wstring statusDetail;
+    int deviceScroll = 0;
+    int hotDeviceIndex = -1;
+    int focusDeviceIndex = -1;
+    bool deviceThumbDragging = false;
+    int deviceThumbDragOffset = 0;
+    bool volumeAvailable = false;
+    bool volumeDragging = false;
+    int systemVolumePercent = 100;
+
     HFONT titleFont = nullptr;
+    HFONT headingFont = nullptr;
     HFONT bodyFont = nullptr;
+    HFONT smallFont = nullptr;
     HBRUSH windowBrush = nullptr;
     HBRUSH surfaceBrush = nullptr;
 };
 
-std::wstring WithDefaultLabel(const PlaybackDeviceInfo& device) {
-    return device.isDefault ? device.name + L"  (default source; muted if unchecked)" : device.name;
-}
+void UpdateButtons(AppState* app);
+void SaveCurrentDeviceConfigs(AppState* app);
+void RefreshSystemVolume(AppState* app);
+
+// ############################
+// Theme and drawing helpers
+// ############################
 
 const Theme& CurrentTheme(AppState* app) {
     return app->dark ? kDarkTheme : kLightTheme;
 }
 
 void ResetBrush(HBRUSH& brush, COLORREF color) {
+    // 如果旧画刷存在, 先释放它, 避免主题切换时泄漏 GDI 对象.
     if (brush) {
         DeleteObject(brush);
     }
+
     brush = CreateSolidBrush(color);
 }
 
-HFONT MakeFont(int pointSize, int weight) {
-    HDC dc = GetDC(nullptr);
-    int height = -MulDiv(pointSize, GetDeviceCaps(dc, LOGPIXELSY), 72);
-    ReleaseDC(nullptr, dc);
-    return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Text");
+int ScaleForDpi(int value, UINT dpi) {
+    return MulDiv(value, static_cast<int>(dpi), 96);
 }
 
-void ApplyTheme(AppState* app) {
-    const auto& theme = CurrentTheme(app);
-    ResetBrush(app->windowBrush, theme.window);
-    ResetBrush(app->surfaceBrush, theme.surface);
-
-    BOOL darkMode = app->dark ? TRUE : FALSE;
-    DwmSetWindowAttribute(app->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
-    int cornerPreference = kDwmCornerRound;
-    int backdrop = kDwmBackdropMainWindow;
-    COLORREF borderColor = theme.border;
-    COLORREF captionColor = app->dark ? RGB(32, 32, 32) : RGB(243, 246, 250);
-    COLORREF captionTextColor = theme.text;
-    DwmSetWindowAttribute(app->hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPreference, sizeof(cornerPreference));
-    HRESULT backdropResult = DwmSetWindowAttribute(app->hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
-    app->useBackdrop = SUCCEEDED(backdropResult);
-    DwmSetWindowAttribute(app->hwnd, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
-    DwmSetWindowAttribute(app->hwnd, DWMWA_CAPTION_COLOR, &captionColor, sizeof(captionColor));
-    DwmSetWindowAttribute(app->hwnd, DWMWA_TEXT_COLOR, &captionTextColor, sizeof(captionTextColor));
-
-    SetWindowTheme(app->list, app->dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    SetWindowTheme(app->start, nullptr, nullptr);
-    SetWindowTheme(app->stop, nullptr, nullptr);
-    SetWindowTheme(app->refresh, nullptr, nullptr);
-    SetWindowTheme(app->themeButton, nullptr, nullptr);
-    SetWindowTheme(app->minButton, nullptr, nullptr);
-    SetWindowTheme(app->maxButton, nullptr, nullptr);
-    SetWindowTheme(app->closeButton, nullptr, nullptr);
-
-    ListView_SetBkColor(app->list, theme.surface);
-    ListView_SetTextBkColor(app->list, theme.surface);
-    ListView_SetTextColor(app->list, theme.text);
-    ListView_SetOutlineColor(app->list, theme.border);
-
-    SetWindowTextW(app->themeButton, app->dark ? L"Light" : L"Dark");
-    InvalidateRect(app->hwnd, nullptr, TRUE);
-    InvalidateRect(app->list, nullptr, TRUE);
-    InvalidateRect(app->volumeSlider, nullptr, TRUE);
-    InvalidateRect(app->start, nullptr, TRUE);
-    InvalidateRect(app->stop, nullptr, TRUE);
-    InvalidateRect(app->refresh, nullptr, TRUE);
-    InvalidateRect(app->themeButton, nullptr, TRUE);
-    InvalidateRect(app->minButton, nullptr, TRUE);
-    InvalidateRect(app->maxButton, nullptr, TRUE);
-    InvalidateRect(app->closeButton, nullptr, TRUE);
+int Scale(AppState* app, int value) {
+    return ScaleForDpi(value, app ? app->dpi : 96);
 }
 
-void DrawModernButton(AppState* app, const DRAWITEMSTRUCT* item) {
-    const auto& theme = CurrentTheme(app);
-    bool disabled = (item->itemState & ODS_DISABLED) != 0;
-    bool pressed = (item->itemState & ODS_SELECTED) != 0;
-    bool focused = (item->itemState & ODS_FOCUS) != 0;
+HFONT MakeFont(int pointSize, int weight, UINT dpi) {
+    int height = -MulDiv(pointSize, static_cast<int>(dpi), 72);
+    return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Text");
+}
 
-    FillRect(item->hDC, &item->rcItem, app->windowBrush);
-
-    COLORREF fill = theme.button;
-    COLORREF outline = theme.border;
-    COLORREF text = theme.text;
-
-    if (pressed) {
-        fill = theme.buttonPressed;
+void ReleaseFontObject(HFONT& font) {
+    if (font) {
+        DeleteObject(font);
+        font = nullptr;
     }
-    if (disabled) {
-        fill = theme.buttonDisabled;
-        outline = app->dark ? RGB(58, 58, 58) : RGB(224, 226, 229);
-        text = app->dark ? RGB(120, 120, 120) : RGB(150, 150, 150);
-    }
-    if (item->CtlID == kStartButton && !disabled) {
-        fill = pressed ? RGB(0, 78, 154) : RGB(0, 95, 184);
-        outline = fill;
-        text = RGB(255, 255, 255);
-    }
+}
 
+void ApplyControlFonts(AppState* app) {
+    SendMessageW(app->title, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->titleFont), TRUE);
+    SendMessageW(app->subtitle, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
+    SendMessageW(app->themeButton, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->smallFont), TRUE);
+    SendMessageW(app->deviceHeading, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->headingFont), TRUE);
+    SendMessageW(app->start, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
+    SendMessageW(app->stop, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
+    SendMessageW(app->refresh, WM_SETFONT,
+        reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
+}
+
+void RebuildFonts(AppState* app) {
+    ReleaseFontObject(app->titleFont);
+    ReleaseFontObject(app->headingFont);
+    ReleaseFontObject(app->bodyFont);
+    ReleaseFontObject(app->smallFont);
+
+    app->titleFont = MakeFont(20, FW_SEMIBOLD, app->dpi);
+    app->headingFont = MakeFont(10, FW_SEMIBOLD, app->dpi);
+    app->bodyFont = MakeFont(9, FW_NORMAL, app->dpi);
+    app->smallFont = MakeFont(8, FW_NORMAL, app->dpi);
+
+    ApplyControlFonts(app);
+}
+
+int FontLineHeight(HWND hwnd, HFONT font) {
+    HDC dc = GetDC(hwnd);
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    TEXTMETRICW metrics = {};
+    GetTextMetricsW(dc, &metrics);
+    SelectObject(dc, oldFont);
+    ReleaseDC(hwnd, dc);
+
+    return metrics.tmHeight + metrics.tmExternalLeading;
+}
+
+int RectWidth(const RECT& rect) {
+    return rect.right - rect.left;
+}
+
+int RectHeight(const RECT& rect) {
+    return rect.bottom - rect.top;
+}
+
+void FillRoundedRect(HDC dc, const RECT& rect, int radius, COLORREF fill,
+    COLORREF border, int borderWidth = 1) {
     HBRUSH brush = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, focused ? 2 : 1, focused ? theme.accent : outline);
-    HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
-    HGDIOBJ oldPen = SelectObject(item->hDC, pen);
+    HPEN pen = CreatePen(PS_SOLID, borderWidth, border);
+    HGDIOBJ oldBrush = SelectObject(dc, brush);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
 
-    RECT rc = item->rcItem;
-    InflateRect(&rc, -1, -1);
-    RoundRect(item->hDC, rc.left, rc.top, rc.right, rc.bottom, 9, 9);
+    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius,
+        radius);
 
-    SelectObject(item->hDC, oldBrush);
-    SelectObject(item->hDC, oldPen);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
     DeleteObject(brush);
     DeleteObject(pen);
-
-    wchar_t label[128] = {};
-    GetWindowTextW(item->hwndItem, label, static_cast<int>(_countof(label)));
-    SetBkMode(item->hDC, TRANSPARENT);
-    SetTextColor(item->hDC, text);
-    SelectObject(item->hDC, app->bodyFont);
-    DrawTextW(item->hDC, label, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
-int GetSliderValue(HWND slider) {
-    return static_cast<int>(GetWindowLongPtrW(slider, GWLP_USERDATA));
+void DrawTextLine(HDC dc, HFONT font, COLORREF color,
+    const std::wstring& text, RECT rect, UINT flags) {
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), -1, &rect, flags);
+    SelectObject(dc, oldFont);
 }
 
-void SetSliderValue(HWND slider, int value) {
-    SetWindowLongPtrW(slider, GWLP_USERDATA, std::clamp(value, 0, 100));
-    InvalidateRect(slider, nullptr, TRUE);
-}
+template <typename PaintFunc>
+void PaintBuffered(HWND hwnd, HDC target, PaintFunc paintFunc) {
+    RECT client = {};
+    GetClientRect(hwnd, &client);
 
-int SliderValueFromX(HWND slider, int x) {
-    RECT rc;
-    GetClientRect(slider, &rc);
-    int left = 12;
-    int right = std::max<int>(left + 1, rc.right - 12);
-    x = std::clamp(x, left, right);
-    return static_cast<int>((x - left) * 100 / static_cast<double>(right - left) + 0.5);
-}
+    int width = RectWidth(client);
+    int height = RectHeight(client);
 
-void UpdateSliderFromPoint(HWND slider, int x) {
-    int value = SliderValueFromX(slider, x);
-    SetSliderValue(slider, value);
-    SendMessageW(GetParent(slider), kSliderChangedMessage, static_cast<WPARAM>(value), reinterpret_cast<LPARAM>(slider));
-}
-
-LRESULT CALLBACK SliderProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE:
-        SetSliderValue(hwnd, 100);
-        return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        HWND parent = GetParent(hwnd);
-        auto* app = reinterpret_cast<AppState*>(GetWindowLongPtrW(parent, GWLP_USERDATA));
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-
-        if (app) {
-            const auto& theme = CurrentTheme(app);
-            FillRect(dc, &rc, app->windowBrush);
-
-            bool enabled = IsWindowEnabled(hwnd) != FALSE;
-            int centerY = (rc.top + rc.bottom) / 2;
-            int left = 12;
-            int right = std::max<int>(left + 1, rc.right - 12);
-            int value = GetSliderValue(hwnd);
-            int thumbX = left + static_cast<int>((right - left) * value / 100.0);
-
-            COLORREF rail = app->dark ? RGB(78, 78, 78) : RGB(210, 214, 220);
-            COLORREF fill = enabled ? theme.accent : (app->dark ? RGB(92, 92, 92) : RGB(180, 184, 190));
-            COLORREF thumb = enabled ? (app->dark ? RGB(245, 245, 245) : RGB(255, 255, 255)) : (app->dark ? RGB(120, 120, 120) : RGB(220, 220, 220));
-            COLORREF thumbBorder = enabled ? theme.accent : theme.border;
-
-            RECT railRc{ left, centerY - 3, right, centerY + 3 };
-            HBRUSH railBrush = CreateSolidBrush(rail);
-            HBRUSH fillBrush = CreateSolidBrush(fill);
-            HBRUSH thumbBrush = CreateSolidBrush(thumb);
-            HPEN noPen = CreatePen(PS_NULL, 0, 0);
-            HPEN thumbPen = CreatePen(PS_SOLID, 1, thumbBorder);
-            HGDIOBJ oldBrush = SelectObject(dc, railBrush);
-            HGDIOBJ oldPen = SelectObject(dc, noPen);
-
-            RoundRect(dc, railRc.left, railRc.top, railRc.right, railRc.bottom, 6, 6);
-            RECT fillRc{ left, centerY - 3, thumbX, centerY + 3 };
-            SelectObject(dc, fillBrush);
-            RoundRect(dc, fillRc.left, fillRc.top, fillRc.right, fillRc.bottom, 6, 6);
-
-            SelectObject(dc, thumbBrush);
-            SelectObject(dc, thumbPen);
-            Ellipse(dc, thumbX - 8, centerY - 8, thumbX + 8, centerY + 8);
-
-            SelectObject(dc, oldBrush);
-            SelectObject(dc, oldPen);
-            DeleteObject(railBrush);
-            DeleteObject(fillBrush);
-            DeleteObject(thumbBrush);
-            DeleteObject(noPen);
-            DeleteObject(thumbPen);
-        } else {
-            FillRect(dc, &rc, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
-        }
-
-        EndPaint(hwnd, &ps);
-        return 0;
+    if (width <= 0 || height <= 0) {
+        return;
     }
-    case WM_LBUTTONDOWN:
-        SetCapture(hwnd);
-        UpdateSliderFromPoint(hwnd, GET_X_LPARAM(lParam));
-        return 0;
-    case WM_MOUSEMOVE:
-        if (GetCapture() == hwnd && (wParam & MK_LBUTTON)) {
-            UpdateSliderFromPoint(hwnd, GET_X_LPARAM(lParam));
-        }
-        return 0;
-    case WM_LBUTTONUP:
-        if (GetCapture() == hwnd) {
-            ReleaseCapture();
-            UpdateSliderFromPoint(hwnd, GET_X_LPARAM(lParam));
-        }
-        return 0;
-    case WM_ENABLE:
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return 0;
-    default:
-        break;
-    }
-    return DefWindowProcW(hwnd, message, wParam, lParam);
+
+    HDC memoryDc = CreateCompatibleDC(target);
+    HBITMAP bitmap = CreateCompatibleBitmap(target, width, height);
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+
+    paintFunc(memoryDc);
+
+    BitBlt(target, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
+
+    SelectObject(memoryDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
 }
 
-void SetStatus(AppState* app, const std::wstring& text) {
-    SetWindowTextW(app->status, text.c_str());
+void RedrawWholeWindow(AppState* app) {
+    if (!app || !app->hwnd) {
+        return;
+    }
+
+    RedrawWindow(app->hwnd, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+}
+
+bool StartsWith(const std::wstring& text, const std::wstring& prefix) {
+    return text.rfind(prefix, 0) == 0;
+}
+
+std::wstring ToLower(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+        [](wchar_t value) {
+            return static_cast<wchar_t>(std::towlower(value));
+        });
+    return text;
+}
+
+bool ContainsText(const std::wstring& text, const std::wstring& needle) {
+    return ToLower(text).find(ToLower(needle)) != std::wstring::npos;
+}
+
+// ############################
+// Device metadata helpers
+// ############################
+
+bool DeviceUsesBluetooth(const PlaybackDeviceInfo& device) {
+    // 蓝牙设备通常在友好名称中包含 bluetooth, 这里用于状态区延迟提示.
+    return ContainsText(device.name, L"bluetooth");
+}
+
+std::wstring DeviceDetailLabel(const PlaybackDeviceInfo& device) {
+    if (device.isDefault) {
+        return L"System playback source";
+    }
+
+    if (DeviceUsesBluetooth(device)) {
+        return L"Wireless audio device";
+    }
+
+    if (ContainsText(device.name, L"hdmi") ||
+        ContainsText(device.name, L"display")) {
+        return L"Display audio endpoint";
+    }
+
+    return L"Windows audio device";
+}
+
+std::wstring DeviceSecondaryLabel(const PlaybackDeviceInfo& device) {
+    // 默认输出设备需要明确标记, 但不把说明塞进主设备名称.
+    if (device.isDefault) {
+        return L"Default output";
+    }
+
+    // 这些标签是轻量推断, 只用于让列表比原始设备名更容易扫读.
+    if (DeviceUsesBluetooth(device)) {
+        return L"Bluetooth";
+    }
+
+    if (ContainsText(device.name, L"headphones") ||
+        ContainsText(device.name, L"headset")) {
+        return L"Headphones";
+    }
+
+    if (ContainsText(device.name, L"speaker") ||
+        ContainsText(device.name, L"speakers") ||
+        ContainsText(device.name, L"realtek")) {
+        return L"Speakers";
+    }
+
+    if (ContainsText(device.name, L"hdmi") ||
+        ContainsText(device.name, L"display") ||
+        ContainsText(device.name, L"nvidia") ||
+        ContainsText(device.name, L"amd")) {
+        return L"Display audio";
+    }
+
+    return L"Windows audio device";
+}
+
+int SelectedDeviceCount(AppState* app) {
+    int count = 0;
+
+    // 遍历选择状态, 让按钮状态和状态区始终与列表保持一致.
+    for (bool selected : app->selected) {
+        if (selected) {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+bool HasSelectedBluetooth(AppState* app) {
+    // 只有被选中的蓝牙设备才需要提示用户可能存在延迟.
+    for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
+         ++i) {
+        if (app->selected[i] && DeviceUsesBluetooth(app->devices[i])) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 std::vector<std::wstring> CheckedDeviceIds(AppState* app) {
     std::vector<std::wstring> ids;
-    int count = ListView_GetItemCount(app->list);
-    for (int i = 0; i < count; ++i) {
-        if (ListView_GetCheckState(app->list, i) && i < static_cast<int>(app->devices.size())) {
-            ids.push_back(app->devices[static_cast<size_t>(i)].id);
+
+    // 保存设备 ID 而不是行号, 因为刷新设备后排序和数量都可能变化.
+    for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
+         ++i) {
+        if (app->selected[i]) {
+            ids.push_back(app->devices[i].id);
         }
     }
-    return ids;
-}
 
-int SelectedIndex(AppState* app) {
-    return ListView_GetNextItem(app->list, -1, LVNI_SELECTED);
+    return ids;
 }
 
 std::vector<OutputSelection> CheckedDevices(AppState* app) {
     std::vector<OutputSelection> devices;
-    int count = ListView_GetItemCount(app->list);
-    for (int i = 0; i < count; ++i) {
-        if (ListView_GetCheckState(app->list, i) && i < static_cast<int>(app->devices.size())) {
-            int volume = i < static_cast<int>(app->volumes.size()) ? app->volumes[static_cast<size_t>(i)] : 100;
-            devices.push_back({ app->devices[static_cast<size_t>(i)].id, static_cast<float>(volume) / 100.0f });
+
+    // UI 已隐藏高级音量比例, 所以每个输出都使用 100% 的直观默认值.
+    for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
+         ++i) {
+        if (app->selected[i]) {
+            devices.push_back({ app->devices[i].id, 1.0f });
         }
     }
+
     return devices;
 }
 
 std::vector<DeviceConfig> CurrentDeviceConfigs(AppState* app) {
     std::vector<DeviceConfig> configs;
-    int count = ListView_GetItemCount(app->list);
-    for (int i = 0; i < count && i < static_cast<int>(app->devices.size()); ++i) {
-        int volume = i < static_cast<int>(app->volumes.size()) ? app->volumes[static_cast<size_t>(i)] : 100;
-        configs.push_back({
-            app->devices[static_cast<size_t>(i)].id,
-            ListView_GetCheckState(app->list, i) != FALSE,
-            static_cast<float>(volume) / 100.0f
-        });
+
+    // 配置仍然写回同一格式, 但不再暴露隐藏的比例滑杆.
+    for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
+         ++i) {
+        configs.push_back({ app->devices[i].id, app->selected[i], 1.0f });
     }
+
     return configs;
 }
 
@@ -407,139 +630,878 @@ void SaveCurrentDeviceConfigs(AppState* app) {
     SaveDeviceConfigs(CurrentDeviceConfigs(app));
 }
 
-void SetVolumeCell(AppState* app, int index) {
+// ############################
+// Status helpers
+// ############################
+
+const wchar_t* StatusText(StatusKind kind) {
+    switch (kind) {
+    case StatusKind::Running:
+        return L"Running";
+    case StatusKind::Error:
+        return L"Error";
+    case StatusKind::Idle:
+    default:
+        return L"Idle";
+    }
+}
+
+void InvalidateStatus(AppState* app) {
+    if (app && app->statusPanel) {
+        InvalidateRect(app->statusPanel, nullptr, TRUE);
+    }
+}
+
+void SetStatus(AppState* app, const std::wstring& text) {
+    // 空状态没有诊断价值, 所以界面退回到 Idle.
+    if (text.empty() || text == L"Idle") {
+        app->statusKind = StatusKind::Idle;
+        app->statusDetail.clear();
+        InvalidateStatus(app);
+        return;
+    }
+
+    // 音频线程用 Error 前缀上报失败, 设备断开也按错误展示.
+    if (StartsWith(text, L"Error") ||
+        StartsWith(text, L"Cannot") ||
+        StartsWith(text, L"Device disconnected") ||
+        StartsWith(text, L"Already") ||
+        StartsWith(text, L"Select ")) {
+        app->statusKind = StatusKind::Error;
+        app->statusDetail = text;
+        InvalidateStatus(app);
+        return;
+    }
+
+    // Running 后面的补充说明保留在第二行, 不污染主状态字段.
+    if (StartsWith(text, L"Running")) {
+        app->statusKind = StatusKind::Running;
+        app->statusDetail.clear();
+
+        if (StartsWith(text, L"Running: ")) {
+            app->statusDetail = text.substr(9);
+        }
+
+        InvalidateStatus(app);
+        return;
+    }
+
+    // Starting 和 Stopping 都是运行过程中的短暂状态, 主状态保持 Running.
+    if (StartsWith(text, L"Starting") || StartsWith(text, L"Stopping")) {
+        app->statusKind = StatusKind::Running;
+        app->statusDetail.clear();
+        InvalidateStatus(app);
+        return;
+    }
+
+    app->statusKind = StatusKind::Error;
+    app->statusDetail = text;
+    InvalidateStatus(app);
+}
+
+// ############################
+// Device list drawing
+// ############################
+
+int DeviceRowHeight(AppState* app) {
+    return Scale(app, kDeviceRowHeight);
+}
+
+int DeviceRowGap(AppState* app) {
+    return Scale(app, kDeviceRowGap);
+}
+
+int DeviceScrollbarWidth(AppState* app) {
+    return Scale(app, 10);
+}
+
+int DeviceContentHeight(AppState* app) {
+    if (app->devices.empty()) {
+        return 0;
+    }
+
+    int count = static_cast<int>(app->devices.size());
+    return count * DeviceRowHeight(app) + (count - 1) *
+        DeviceRowGap(app);
+}
+
+bool DeviceNeedsScroll(AppState* app) {
+    RECT rect = {};
+    GetClientRect(app->deviceList, &rect);
+
+    return DeviceContentHeight(app) > RectHeight(rect);
+}
+
+int MaxDeviceScroll(AppState* app) {
+    RECT rect = {};
+    GetClientRect(app->deviceList, &rect);
+
+    return std::max(0, DeviceContentHeight(app) - RectHeight(rect));
+}
+
+void UpdateDeviceScrollBar(AppState* app) {
+    if (!app || !app->deviceList) {
+        return;
+    }
+
+    RECT rect = {};
+    GetClientRect(app->deviceList, &rect);
+
+    int contentHeight = DeviceContentHeight(app);
+    int pageHeight = std::max(1, RectHeight(rect));
+    int maxScroll = std::max(0, contentHeight - pageHeight);
+
+    // 自绘滚动条在客户区内绘制, 避免原生非客户区滚动条留下脏区.
+    app->deviceScroll = std::clamp(app->deviceScroll, 0, maxScroll);
+    InvalidateRect(app->deviceList, nullptr, TRUE);
+}
+
+void SetDeviceScroll(AppState* app, int requestedScroll) {
+    int nextScroll = std::clamp(requestedScroll, 0, MaxDeviceScroll(app));
+
+    if (nextScroll == app->deviceScroll) {
+        return;
+    }
+
+    app->deviceScroll = nextScroll;
+    UpdateDeviceScrollBar(app);
+    InvalidateRect(app->deviceList, nullptr, TRUE);
+}
+
+void EnsureDeviceVisible(AppState* app, int index) {
     if (index < 0 || index >= static_cast<int>(app->devices.size())) {
         return;
     }
 
-    std::wstring text;
-    if (app->devices[static_cast<size_t>(index)].isDefault) {
-        text = L"Windows";
+    RECT rect = {};
+    GetClientRect(app->deviceList, &rect);
+
+    int rowHeight = DeviceRowHeight(app);
+    int stride = rowHeight + DeviceRowGap(app);
+    int itemTop = index * stride;
+    int itemBottom = itemTop + rowHeight;
+
+    // 焦点行在可视区域上方时向上滚动.
+    if (itemTop < app->deviceScroll) {
+        SetDeviceScroll(app, itemTop);
+        return;
+    }
+
+    // 焦点行在可视区域下方时向下滚动.
+    if (itemBottom > app->deviceScroll + RectHeight(rect)) {
+        SetDeviceScroll(app, itemBottom - RectHeight(rect));
+    }
+}
+
+int DeviceIndexFromPoint(AppState* app, int y) {
+    int contentY = y + app->deviceScroll;
+    int rowHeight = DeviceRowHeight(app);
+    int stride = rowHeight + DeviceRowGap(app);
+
+    if (contentY < 0 || stride <= 0) {
+        return -1;
+    }
+
+    int index = contentY / stride;
+    int offset = contentY % stride;
+
+    // 行间距区域不响应点击, 这样列表触感更像卡片而不是表格.
+    if (offset >= rowHeight) {
+        return -1;
+    }
+
+    if (index < 0 || index >= static_cast<int>(app->devices.size())) {
+        return -1;
+    }
+
+    return index;
+}
+
+RECT DeviceThumbRect(AppState* app) {
+    RECT client = {};
+    GetClientRect(app->deviceList, &client);
+
+    RECT empty = {};
+    int contentHeight = DeviceContentHeight(app);
+    int pageHeight = RectHeight(client);
+
+    if (contentHeight <= pageHeight || pageHeight <= 0) {
+        return empty;
+    }
+
+    int trackInset = Scale(app, 4);
+    int trackTop = client.top + trackInset;
+    int trackBottom = client.bottom - trackInset;
+    int trackHeight = std::max(1, trackBottom - trackTop);
+    int thumbHeight = std::max(Scale(app, 28),
+        MulDiv(pageHeight, trackHeight, contentHeight));
+    thumbHeight = std::min(thumbHeight, trackHeight);
+
+    int maxScroll = std::max(1, contentHeight - pageHeight);
+    int thumbTravel = std::max(1, trackHeight - thumbHeight);
+    int thumbTop = trackTop + MulDiv(app->deviceScroll, thumbTravel,
+        maxScroll);
+
+    return RECT{
+        client.right - DeviceScrollbarWidth(app) + Scale(app, 2),
+        thumbTop,
+        client.right - Scale(app, 3),
+        thumbTop + thumbHeight
+    };
+}
+
+void DrawDeviceScrollbar(AppState* app, HDC dc) {
+    if (!DeviceNeedsScroll(app)) {
+        return;
+    }
+
+    const Theme& theme = CurrentTheme(app);
+    RECT thumb = DeviceThumbRect(app);
+
+    FillRoundedRect(dc, thumb, Scale(app, 4), theme.borderStrong,
+        theme.borderStrong);
+}
+
+void DrawCheckbox(HDC dc, const RECT& rect, bool checked, bool enabled,
+    const Theme& theme) {
+    COLORREF fill = checked ? theme.accent : theme.surface;
+    COLORREF border = checked ? theme.accent : theme.borderStrong;
+
+    if (!enabled) {
+        fill = checked ? theme.textDisabled : theme.buttonDisabled;
+        border = theme.border;
+    }
+
+    FillRoundedRect(dc, rect, std::max(4, RectHeight(rect) / 4), fill,
+        border);
+
+    if (!checked) {
+        return;
+    }
+
+    COLORREF checkColor = enabled ? RGB(250, 250, 250) : theme.surface;
+    int width = RectWidth(rect);
+    int height = RectHeight(rect);
+    HPEN pen = CreatePen(PS_SOLID, std::max(2, width / 8), checkColor);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+
+    MoveToEx(dc, rect.left + width / 4, rect.top + height / 2,
+        nullptr);
+    LineTo(dc, rect.left + width / 2 - 1, rect.bottom - height / 4);
+    LineTo(dc, rect.right - width / 5, rect.top + height / 4);
+
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+void DrawDevicePill(HDC dc, AppState* app, const std::wstring& text,
+    bool isDefault, bool enabled, RECT row) {
+    const Theme& theme = CurrentTheme(app);
+    SIZE textSize = {};
+
+    HGDIOBJ oldFont = SelectObject(dc, app->smallFont);
+    GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()),
+        &textSize);
+
+    int maxWidth = std::max(Scale(app, 96),
+        std::min(Scale(app, 150), RectWidth(row) / 3));
+    int pillTextWidth = static_cast<int>(textSize.cx);
+    int pillWidth = std::min(maxWidth, pillTextWidth + Scale(app, 18));
+    int pillHeight = FontLineHeight(app->deviceList, app->smallFont) +
+        Scale(app, 8);
+    int pillTop = row.top + (RectHeight(row) - pillHeight) / 2;
+    RECT pill = {
+        row.right - pillWidth - Scale(app, 14),
+        pillTop,
+        row.right - Scale(app, 14),
+        pillTop + pillHeight
+    };
+
+    COLORREF fill = isDefault ? theme.accentSoft : theme.surfaceHover;
+    COLORREF border = isDefault ? theme.accent : theme.border;
+    COLORREF color = isDefault ? theme.accent : theme.textMuted;
+
+    if (!enabled) {
+        fill = theme.buttonDisabled;
+        border = theme.border;
+        color = theme.textDisabled;
+    }
+
+    FillRoundedRect(dc, pill, Scale(app, 8), fill, border);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), -1, &pill,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(dc, oldFont);
+}
+
+void DrawDeviceList(AppState* app, HDC dc) {
+    const Theme& theme = CurrentTheme(app);
+    RECT client = {};
+    GetClientRect(app->deviceList, &client);
+
+    FillRect(dc, &client, app->windowBrush);
+
+    if (app->devices.empty()) {
+        RECT emptyRect = client;
+        DrawTextLine(dc, app->bodyFont, theme.textMuted,
+            L"No active output devices found.", emptyRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+
+    bool enabled = IsWindowEnabled(app->deviceList) != FALSE;
+    int rowHeight = DeviceRowHeight(app);
+    int rowGap = DeviceRowGap(app);
+    int stride = rowHeight + rowGap;
+    int rightInset = DeviceNeedsScroll(app) ? DeviceScrollbarWidth(app) : 0;
+    int checkboxSize = Scale(app, 18);
+    int checkboxLeft = Scale(app, 16);
+    int textLeft = Scale(app, 48);
+
+    // 只绘制可见行, 避免设备很多时产生无意义的 GDI 绘制.
+    for (int i = 0; i < static_cast<int>(app->devices.size()); ++i) {
+        int y = i * stride - app->deviceScroll;
+
+        if (y > client.bottom || y + rowHeight < client.top) {
+            continue;
+        }
+
+        RECT row = {
+            client.left + 1,
+            y,
+            client.right - rightInset - 1,
+            y + rowHeight
+        };
+
+        if (RectWidth(row) < Scale(app, 160)) {
+            row.right = client.right - 1;
+        }
+
+        bool checked = i < static_cast<int>(app->selected.size()) &&
+            app->selected[static_cast<size_t>(i)];
+        bool hot = i == app->hotDeviceIndex && enabled;
+        bool focused = i == app->focusDeviceIndex &&
+            GetFocus() == app->deviceList;
+
+        COLORREF fill = hot ? theme.surfaceHover : theme.surface;
+        COLORREF border = checked ? theme.accent : theme.border;
+        int borderWidth = focused ? 2 : 1;
+
+        if (!enabled) {
+            fill = theme.surface;
+            border = theme.border;
+        }
+
+        FillRoundedRect(dc, row, Scale(app, kCardRadius), fill, border,
+            borderWidth);
+
+        RECT checkbox = {
+            row.left + checkboxLeft,
+            row.top + (rowHeight - checkboxSize) / 2,
+            row.left + checkboxLeft + checkboxSize,
+            row.top + (rowHeight + checkboxSize) / 2
+        };
+        DrawCheckbox(dc, checkbox, checked, enabled, theme);
+
+        std::wstring label = DeviceSecondaryLabel(app->devices[i]);
+        DrawDevicePill(dc, app, label, app->devices[i].isDefault, enabled,
+            row);
+
+        int labelReserve = std::max(Scale(app, 118),
+            std::min(Scale(app, 172), RectWidth(row) / 3));
+        int nameHeight = FontLineHeight(app->deviceList, app->bodyFont) +
+            Scale(app, 2);
+        int detailHeight = FontLineHeight(app->deviceList, app->smallFont) +
+            Scale(app, 1);
+        int textTop = row.top + (rowHeight - nameHeight - detailHeight) / 2;
+        int textRight = std::max(row.left + textLeft + Scale(app, 60),
+            row.right - labelReserve - Scale(app, 20));
+        RECT nameRect = {
+            row.left + textLeft,
+            textTop,
+            textRight,
+            textTop + nameHeight
+        };
+
+        RECT typeRect = {
+            row.left + textLeft,
+            textTop + nameHeight,
+            row.right - Scale(app, 20),
+            textTop + nameHeight + detailHeight
+        };
+
+        COLORREF titleColor = enabled ? theme.text : theme.textDisabled;
+        COLORREF detailColor = enabled ? theme.textMuted : theme.textDisabled;
+
+        DrawTextLine(dc, app->bodyFont, titleColor, app->devices[i].name,
+            nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+            DT_END_ELLIPSIS);
+        DrawTextLine(dc, app->smallFont, detailColor,
+            DeviceDetailLabel(app->devices[i]), typeRect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    DrawDeviceScrollbar(app, dc);
+}
+
+void ToggleDevice(AppState* app, int index) {
+    if (app->engine.IsRunning()) {
+        return;
+    }
+
+    if (index < 0 || index >= static_cast<int>(app->selected.size())) {
+        return;
+    }
+
+    app->selected[static_cast<size_t>(index)] =
+        !app->selected[static_cast<size_t>(index)];
+    app->focusDeviceIndex = index;
+
+    SaveCurrentDeviceConfigs(app);
+    UpdateButtons(app);
+    InvalidateRect(app->deviceList, nullptr, TRUE);
+    InvalidateStatus(app);
+}
+
+// ############################
+// Button drawing
+// ############################
+
+void DrawThemeButton(AppState* app, const DRAWITEMSTRUCT* item) {
+    const Theme& theme = CurrentTheme(app);
+    RECT rect = item->rcItem;
+
+    FillRect(item->hDC, &rect, app->windowBrush);
+    InflateRect(&rect, -1, -1);
+    FillRoundedRect(item->hDC, rect, Scale(app, 8), theme.button,
+        theme.border);
+
+    int middle = rect.left + RectWidth(rect) / 2;
+    int inset = Scale(app, 2);
+    RECT lightRect = {
+        rect.left + inset,
+        rect.top + inset,
+        middle,
+        rect.bottom - inset
+    };
+    RECT darkRect = {
+        middle,
+        rect.top + inset,
+        rect.right - inset,
+        rect.bottom - inset
+    };
+    RECT selectedRect = app->dark ? darkRect : lightRect;
+
+    FillRoundedRect(item->hDC, selectedRect, Scale(app, 7), theme.accentSoft,
+        theme.accent);
+
+    HPEN separatorPen = CreatePen(PS_SOLID, 1, theme.border);
+    HGDIOBJ oldPen = SelectObject(item->hDC, separatorPen);
+    MoveToEx(item->hDC, middle, rect.top + Scale(app, 6), nullptr);
+    LineTo(item->hDC, middle, rect.bottom - Scale(app, 6));
+    SelectObject(item->hDC, oldPen);
+    DeleteObject(separatorPen);
+
+    DrawTextLine(item->hDC, app->smallFont,
+        app->dark ? theme.textMuted : theme.accent, L"Light", lightRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextLine(item->hDC, app->smallFont,
+        app->dark ? theme.accent : theme.textMuted, L"Dark", darkRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+void DrawModernButton(AppState* app, const DRAWITEMSTRUCT* item) {
+    if (item->CtlID == kThemeButton) {
+        DrawThemeButton(app, item);
+        return;
+    }
+
+    const Theme& theme = CurrentTheme(app);
+    bool disabled = (item->itemState & ODS_DISABLED) != 0;
+    bool pressed = (item->itemState & ODS_SELECTED) != 0;
+    bool focused = (item->itemState & ODS_FOCUS) != 0;
+    bool primary = item->CtlID == kStartButton;
+
+    RECT rect = item->rcItem;
+    FillRect(item->hDC, &rect, app->windowBrush);
+    InflateRect(&rect, -1, -1);
+
+    COLORREF fill = primary ? theme.accent : theme.button;
+    COLORREF border = primary ? theme.accent : theme.border;
+    COLORREF text = primary ? RGB(250, 250, 250) : theme.text;
+
+    if (pressed && !disabled) {
+        fill = primary ? theme.accentPressed : theme.buttonPressed;
+    }
+
+    if (disabled) {
+        fill = theme.buttonDisabled;
+        border = theme.border;
+        text = theme.textDisabled;
+    }
+
+    if (focused && !disabled) {
+        border = theme.accent;
+    }
+
+    FillRoundedRect(item->hDC, rect, Scale(app, 8), fill, border,
+        focused ? 2 : 1);
+
+    wchar_t label[128] = {};
+    GetWindowTextW(item->hwndItem, label, static_cast<int>(_countof(label)));
+
+    DrawTextLine(item->hDC, app->bodyFont, text, label, rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+// ############################
+// Status panel drawing
+// ############################
+
+COLORREF StatusColor(AppState* app) {
+    const Theme& theme = CurrentTheme(app);
+
+    switch (app->statusKind) {
+    case StatusKind::Running:
+        return theme.ok;
+    case StatusKind::Error:
+        return theme.error;
+    case StatusKind::Idle:
+    default:
+        return theme.textMuted;
+    }
+}
+
+std::wstring StatusSummary(AppState* app) {
+    std::wstring summary = L"Status: ";
+    summary += StatusText(app->statusKind);
+    summary += L" - Selected devices: ";
+    summary += std::to_wstring(SelectedDeviceCount(app));
+    return summary;
+}
+
+std::wstring StatusDetail(AppState* app) {
+    if (!app->statusDetail.empty()) {
+        return app->statusDetail;
+    }
+
+    if (HasSelectedBluetooth(app)) {
+        return L"Bluetooth devices may add latency.";
+    }
+
+    if (SelectedDeviceCount(app) == 0) {
+        return L"No output devices selected.";
+    }
+
+    return L"Ready to duplicate audio to selected outputs.";
+}
+
+std::wstring SystemVolumeLabel(AppState* app) {
+    if (!app->volumeAvailable) {
+        return L"System volume unavailable";
+    }
+
+    return L"System volume: " +
+        std::to_wstring(app->systemVolumePercent) + L"%";
+}
+
+RECT VolumeTrackRect(AppState* app) {
+    RECT client = {};
+    GetClientRect(app->statusPanel, &client);
+
+    int padding = Scale(app, 16);
+    int labelWidth = Scale(app, 142);
+    int trackTop = client.bottom - Scale(app, 24);
+    int trackHeight = Scale(app, 6);
+
+    return RECT{
+        client.left + padding + labelWidth,
+        trackTop,
+        client.right - padding,
+        trackTop + trackHeight
+    };
+}
+
+RECT VolumeThumbRect(AppState* app) {
+    RECT track = VolumeTrackRect(app);
+    int thumbSize = Scale(app, 16);
+    int trackWidth = std::max(1, RectWidth(track));
+    int thumbX = track.left + MulDiv(app->systemVolumePercent, trackWidth,
+        100);
+    int centerY = track.top + RectHeight(track) / 2;
+
+    return RECT{
+        thumbX - thumbSize / 2,
+        centerY - thumbSize / 2,
+        thumbX + thumbSize / 2,
+        centerY + thumbSize / 2
+    };
+}
+
+int VolumePercentFromX(AppState* app, int x) {
+    RECT track = VolumeTrackRect(app);
+    int width = std::max(1, RectWidth(track));
+    int trackLeft = static_cast<int>(track.left);
+    int trackRight = static_cast<int>(track.right);
+    int clampedX = std::clamp(x, trackLeft, trackRight);
+
+    return std::clamp(MulDiv(clampedX - trackLeft, 100, width), 0, 100);
+}
+
+bool PointInVolumeSlider(AppState* app, POINT point) {
+    RECT track = VolumeTrackRect(app);
+    RECT thumb = VolumeThumbRect(app);
+    InflateRect(&track, Scale(app, 6), Scale(app, 10));
+    InflateRect(&thumb, Scale(app, 4), Scale(app, 4));
+
+    return PtInRect(&track, point) || PtInRect(&thumb, point);
+}
+
+void SetSystemVolumeFromPoint(AppState* app, int x) {
+    if (!app || !app->volumeAvailable || !app->volumeController) {
+        return;
+    }
+
+    int next = VolumePercentFromX(app, x);
+    app->systemVolumePercent = next;
+
+    if (!app->volumeController->SetVolumePercent(next)) {
+        app->volumeAvailable = false;
+    }
+
+    InvalidateStatus(app);
+}
+
+void RefreshSystemVolume(AppState* app) {
+    if (!app || !app->hwnd) {
+        return;
+    }
+
+    if (!app->volumeController) {
+        app->volumeController =
+            std::make_unique<SystemVolumeController>();
+    }
+
+    app->volumeAvailable = app->volumeController->Open(app->hwnd);
+
+    int percent = app->systemVolumePercent;
+
+    if (app->volumeAvailable &&
+        app->volumeController->GetVolumePercent(&percent)) {
+        app->systemVolumePercent = percent;
     } else {
-        int volume = index < static_cast<int>(app->volumes.size()) ? app->volumes[static_cast<size_t>(index)] : 100;
-        text = std::to_wstring(volume) + L"%";
+        app->volumeAvailable = false;
     }
-    ListView_SetItemText(app->list, index, 1, text.data());
+
+    InvalidateStatus(app);
 }
 
-void UpdateVolumeControls(AppState* app) {
-    int index = SelectedIndex(app);
-    bool valid = index >= 0 && index < static_cast<int>(app->devices.size());
-    bool adjustable = valid && !app->devices[static_cast<size_t>(index)].isDefault;
-    EnableWindow(app->volumeSlider, adjustable);
+void DrawStatusPanel(AppState* app, HDC dc) {
+    const Theme& theme = CurrentTheme(app);
+    RECT client = {};
+    GetClientRect(app->statusPanel, &client);
 
-    if (!valid) {
-        SetWindowTextW(app->volumeLabel, L"Selected ratio: -");
-        SetSliderValue(app->volumeSlider, 100);
-        return;
+    FillRect(dc, &client, app->windowBrush);
+
+    RECT panel = client;
+    InflateRect(&panel, -1, -1);
+    FillRoundedRect(dc, panel, Scale(app, kCardRadius), theme.surface,
+        theme.border);
+
+    int padding = Scale(app, 16);
+    int summaryHeight = FontLineHeight(app->statusPanel, app->bodyFont) +
+        Scale(app, 2);
+    int detailHeight = FontLineHeight(app->statusPanel, app->smallFont) +
+        Scale(app, 1);
+    RECT dot = {
+        panel.left + padding,
+        panel.top + Scale(app, 15),
+        panel.left + padding + Scale(app, 10),
+        panel.top + Scale(app, 25)
+    };
+    HBRUSH dotBrush = CreateSolidBrush(StatusColor(app));
+    HPEN dotPen = CreatePen(PS_NULL, 0, 0);
+    HGDIOBJ oldBrush = SelectObject(dc, dotBrush);
+    HGDIOBJ oldPen = SelectObject(dc, dotPen);
+    Ellipse(dc, dot.left, dot.top, dot.right, dot.bottom);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(dotBrush);
+    DeleteObject(dotPen);
+
+    RECT summaryRect = {
+        panel.left + Scale(app, 36),
+        panel.top + Scale(app, 8),
+        panel.right - padding,
+        panel.top + Scale(app, 8) + summaryHeight
+    };
+    RECT detailRect = {
+        panel.left + Scale(app, 36),
+        summaryRect.bottom,
+        panel.right - padding,
+        summaryRect.bottom + detailHeight
+    };
+
+    COLORREF detailColor = app->statusKind == StatusKind::Error
+        ? theme.error
+        : theme.textMuted;
+
+    if (app->statusDetail.empty() && HasSelectedBluetooth(app)) {
+        detailColor = theme.warning;
     }
 
-    if (app->devices[static_cast<size_t>(index)].isDefault) {
-        SetWindowTextW(app->volumeLabel, L"Selected ratio: Windows system volume");
-        SetSliderValue(app->volumeSlider, 100);
-        return;
-    }
+    DrawTextLine(dc, app->bodyFont, theme.text, StatusSummary(app),
+        summaryRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS);
+    DrawTextLine(dc, app->smallFont, detailColor, StatusDetail(app),
+        detailRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS);
 
-    int volume = index < static_cast<int>(app->volumes.size()) ? app->volumes[static_cast<size_t>(index)] : 100;
-    std::wstring label = L"Selected ratio: " + std::to_wstring(volume) + L"%";
-    SetWindowTextW(app->volumeLabel, label.c_str());
-    SetSliderValue(app->volumeSlider, volume);
+    RECT labelRect = {
+        panel.left + padding,
+        panel.bottom - Scale(app, 31),
+        panel.left + padding + Scale(app, 136),
+        panel.bottom - Scale(app, 10)
+    };
+    RECT track = VolumeTrackRect(app);
+    RECT thumb = VolumeThumbRect(app);
+
+    COLORREF labelColor = app->volumeAvailable
+        ? theme.text
+        : theme.textDisabled;
+    COLORREF railColor = app->dark ? RGB(74, 77, 84) : RGB(216, 222, 230);
+    COLORREF fillColor = app->volumeAvailable
+        ? theme.accent
+        : theme.textDisabled;
+    COLORREF thumbColor = app->dark ? RGB(245, 247, 250) :
+        RGB(255, 255, 255);
+
+    DrawTextLine(dc, app->smallFont, labelColor, SystemVolumeLabel(app),
+        labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS);
+
+    RECT rail = track;
+    RECT fill = track;
+    fill.right = track.left + MulDiv(app->systemVolumePercent,
+        RectWidth(track), 100);
+
+    FillRoundedRect(dc, rail, Scale(app, 5), railColor, railColor);
+    FillRoundedRect(dc, fill, Scale(app, 5), fillColor, fillColor);
+    FillRoundedRect(dc, thumb, Scale(app, 8), thumbColor, theme.accent);
 }
 
-void UpdateButtons(AppState* app) {
-    bool running = app->engine.IsRunning();
-    bool hasSelection = !CheckedDeviceIds(app).empty();
-    EnableWindow(app->start, !running && hasSelection);
-    EnableWindow(app->stop, running);
-    EnableWindow(app->refresh, !running);
-    EnableWindow(app->list, !running);
-    UpdateVolumeControls(app);
+// ############################
+// Layout and theme application
+// ############################
+
+void ApplyTheme(AppState* app) {
+    const Theme& theme = CurrentTheme(app);
+    ResetBrush(app->windowBrush, theme.background);
+    ResetBrush(app->surfaceBrush, theme.surface);
+
+    BOOL darkMode = app->dark ? TRUE : FALSE;
+    int cornerPreference = kDwmCornerRound;
+    int backdrop = kDwmBackdropNone;
+    COLORREF borderColor = theme.border;
+    COLORREF captionColor = theme.background;
+    COLORREF captionTextColor = theme.text;
+
+    DwmSetWindowAttribute(app->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &darkMode, sizeof(darkMode));
+    DwmSetWindowAttribute(app->hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+        &cornerPreference, sizeof(cornerPreference));
+    DwmSetWindowAttribute(app->hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+        &backdrop, sizeof(backdrop));
+    DwmSetWindowAttribute(app->hwnd, DWMWA_BORDER_COLOR, &borderColor,
+        sizeof(borderColor));
+    DwmSetWindowAttribute(app->hwnd, DWMWA_CAPTION_COLOR, &captionColor,
+        sizeof(captionColor));
+    DwmSetWindowAttribute(app->hwnd, DWMWA_TEXT_COLOR, &captionTextColor,
+        sizeof(captionTextColor));
+
+    SetWindowTheme(app->deviceList,
+        app->dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+
+    RedrawWholeWindow(app);
 }
 
 void Resize(AppState* app) {
-    RECT rc;
-    GetClientRect(app->hwnd, &rc);
-    int margin = 12;
-    int headerH = 70;
-    int buttonH = 30;
-    int sliderH = 34;
-    int statusH = 24;
-    int gap = 8;
-    int width = rc.right - rc.left;
-    int height = rc.bottom - rc.top;
+    RECT rect = {};
+    GetClientRect(app->hwnd, &rect);
 
-    int titleButtonH = 36;
-    int titleButtonY = 4;
-    int closeW = 46;
-    int themeW = 74;
-    MoveWindow(app->closeButton, width - closeW, titleButtonY, closeW, titleButtonH, TRUE);
-    MoveWindow(app->maxButton, width - closeW * 2, titleButtonY, closeW, titleButtonH, TRUE);
-    MoveWindow(app->minButton, width - closeW * 3, titleButtonY, closeW, titleButtonH, TRUE);
-    MoveWindow(app->themeButton, width - closeW * 3 - themeW - 8, titleButtonY, themeW, titleButtonH, TRUE);
+    int width = RectWidth(rect);
+    int height = RectHeight(rect);
+    int margin = Scale(app, 24);
+    int top = Scale(app, 20);
+    int themeWidth = Scale(app, 124);
+    int themeHeight = std::max(Scale(app, 32),
+        FontLineHeight(app->hwnd, app->smallFont) + Scale(app, 14));
+    int titleHeight = FontLineHeight(app->hwnd, app->titleFont) +
+        Scale(app, 8);
+    int subtitleHeight = FontLineHeight(app->hwnd, app->bodyFont) +
+        Scale(app, 6);
+    int headingHeight = FontLineHeight(app->hwnd, app->headingFont) +
+        Scale(app, 6);
+    int buttonHeight = std::max(Scale(app, 34),
+        FontLineHeight(app->hwnd, app->bodyFont) + Scale(app, 16));
+    int statusHeight = FontLineHeight(app->hwnd, app->bodyFont) +
+        FontLineHeight(app->hwnd, app->smallFont) * 2 + Scale(app, 44);
 
-    int contentTop = kTitleBarHeight + headerH;
-    int listH = height - contentTop - margin * 2 - buttonH - sliderH - statusH - gap * 2;
-    if (listH < 80) {
-        listH = 80;
-    }
+    int titleRight = width - margin - themeWidth - Scale(app, 14);
+    titleRight = std::max(margin + Scale(app, 180), titleRight);
 
-    MoveWindow(app->title, margin, kTitleBarHeight + 8, width - margin * 2, 30, TRUE);
-    MoveWindow(app->subtitle, margin, kTitleBarHeight + 40, width - margin * 2, 24, TRUE);
-    MoveWindow(app->list, margin, contentTop, width - margin * 2, listH, TRUE);
+    MoveWindow(app->title, margin, top, titleRight - margin, titleHeight,
+        TRUE);
+    MoveWindow(app->subtitle, margin, top + titleHeight,
+        titleRight - margin, subtitleHeight, TRUE);
+    MoveWindow(app->themeButton, width - margin - themeWidth, top,
+        themeWidth, themeHeight, TRUE);
 
-    int y = contentTop + listH + gap;
-    MoveWindow(app->start, margin, y, 84, buttonH, TRUE);
-    MoveWindow(app->stop, margin + 92, y, 84, buttonH, TRUE);
-    MoveWindow(app->refresh, margin + 184, y, 116, buttonH, TRUE);
-    int sliderY = y + buttonH + gap;
-    MoveWindow(app->volumeLabel, margin, sliderY + 4, 230, statusH, TRUE);
-    MoveWindow(app->volumeSlider, margin + 230, sliderY, width - margin * 2 - 230, sliderH, TRUE);
-    MoveWindow(app->status, margin, sliderY + sliderH + 2, width - margin * 2, statusH, TRUE);
+    int headingY = top + titleHeight + subtitleHeight + Scale(app, 22);
+    MoveWindow(app->deviceHeading, margin, headingY, width - margin * 2,
+        headingHeight, TRUE);
 
-    ListView_SetColumnWidth(app->list, 0, width - margin * 3 - 90);
-    ListView_SetColumnWidth(app->list, 1, 90);
+    int statusY = height - margin - statusHeight;
+    int buttonY = statusY - Scale(app, 12) - buttonHeight;
+    int listY = headingY + headingHeight + Scale(app, 8);
+    int listHeight = buttonY - Scale(app, 14) - listY;
+    listHeight = std::max(Scale(app, 112), listHeight);
+
+    MoveWindow(app->deviceList, margin, listY, width - margin * 2,
+        listHeight, TRUE);
+
+    MoveWindow(app->start, margin, buttonY, Scale(app, 88),
+        buttonHeight, TRUE);
+    MoveWindow(app->stop, margin + Scale(app, 96), buttonY,
+        Scale(app, 88), buttonHeight, TRUE);
+    MoveWindow(app->refresh, margin + Scale(app, 192), buttonY,
+        Scale(app, 96), buttonHeight, TRUE);
+    MoveWindow(app->statusPanel, margin, statusY, width - margin * 2,
+        statusHeight, TRUE);
+
+    UpdateDeviceScrollBar(app);
 }
+
+// ############################
+// Device refresh and commands
+// ############################
 
 void RefreshDevices(AppState* app) {
     auto savedConfigs = LoadDeviceConfigs();
     auto previouslySelected = CheckedDeviceIds(app);
 
-    auto oldDevices = app->devices;
-    auto oldVolumes = app->volumes;
-    ListView_DeleteAllItems(app->list);
     std::wstring error;
     app->devices = EnumeratePlaybackDevices(&error);
-    app->volumes.assign(app->devices.size(), 100);
-    for (size_t i = 0; i < app->devices.size(); ++i) {
-        for (const auto& config : savedConfigs) {
-            if (app->devices[i].id == config.id) {
-                app->volumes[i] = static_cast<int>(std::clamp(config.volume, 0.0f, 1.0f) * 100.0f + 0.5f);
-                break;
-            }
-        }
-        for (size_t j = 0; j < oldDevices.size() && j < oldVolumes.size(); ++j) {
-            if (app->devices[i].id == oldDevices[j].id) {
-                app->volumes[i] = oldVolumes[j];
-                break;
-            }
-        }
-    }
-    if (!error.empty()) {
-        SetStatus(app, error);
-    } else {
-        SetStatus(app, L"Idle");
-    }
+    app->selected.assign(app->devices.size(), false);
+    RefreshSystemVolume(app);
 
     for (size_t i = 0; i < app->devices.size(); ++i) {
-        auto text = WithDefaultLabel(app->devices[i]);
-        LVITEMW item = {};
-        item.mask = LVIF_TEXT;
-        item.iItem = static_cast<int>(i);
-        item.pszText = text.data();
-        ListView_InsertItem(app->list, &item);
-        SetVolumeCell(app, static_cast<int>(i));
+        bool checked = std::find(previouslySelected.begin(),
+            previouslySelected.end(), app->devices[i].id) !=
+            previouslySelected.end();
 
-        bool checked = std::find(previouslySelected.begin(), previouslySelected.end(), app->devices[i].id) != previouslySelected.end();
+        // 如果当前没有临时选择, 就从配置文件恢复上次明确保存的选择.
         if (previouslySelected.empty()) {
             for (const auto& config : savedConfigs) {
                 if (config.id == app->devices[i].id) {
@@ -548,34 +1510,51 @@ void RefreshDevices(AppState* app) {
                 }
             }
         }
-        ListView_SetCheckState(app->list, static_cast<int>(i), checked);
+
+        app->selected[i] = checked;
     }
 
+    if (!error.empty()) {
+        SetStatus(app, error);
+    } else {
+        SetStatus(app, L"Idle");
+    }
+
+    app->deviceScroll = 0;
+    app->hotDeviceIndex = -1;
+    app->focusDeviceIndex = app->devices.empty() ? -1 : 0;
+
+    UpdateDeviceScrollBar(app);
     UpdateButtons(app);
+    InvalidateRect(app->deviceList, nullptr, TRUE);
+    InvalidateStatus(app);
 }
 
 void Start(AppState* app) {
     auto devices = CheckedDevices(app);
+
     if (devices.empty()) {
         return;
     }
 
     SaveCurrentDeviceConfigs(app);
-    if (devices.size() == 1) {
-        SetStatus(app, L"Running one selected device; duplication may be unnecessary.");
-    } else {
-        SetStatus(app, L"Starting...");
-    }
+    SetStatus(app, L"Starting...");
 
     std::wstring error;
-    bool ok = app->engine.Start(devices, [hwnd = app->hwnd](const std::wstring& text) {
-        auto* copy = new std::wstring(text);
-        PostMessageW(hwnd, kStatusMessage, 0, reinterpret_cast<LPARAM>(copy));
-    }, &error);
+    bool ok = app->engine.Start(devices,
+        [hwnd = app->hwnd](const std::wstring& text) {
+            auto* copy = new std::wstring(text);
+            PostMessageW(hwnd, kStatusMessage, 0,
+                reinterpret_cast<LPARAM>(copy));
+        },
+        &error);
 
     if (!ok) {
         SetStatus(app, error);
+    } else {
+        SetStatus(app, L"Running");
     }
+
     UpdateButtons(app);
 }
 
@@ -586,130 +1565,348 @@ void Stop(AppState* app) {
     UpdateButtons(app);
 }
 
-bool ScreenPointInWindow(HWND child, POINT screenPoint) {
-    if (!child) {
-        return false;
-    }
-    RECT rc;
-    GetWindowRect(child, &rc);
-    return PtInRect(&rc, screenPoint) != FALSE;
+void UpdateButtons(AppState* app) {
+    bool running = app->engine.IsRunning();
+    bool hasSelection = SelectedDeviceCount(app) > 0;
+
+    EnableWindow(app->start, !running && hasSelection);
+    EnableWindow(app->stop, running);
+    EnableWindow(app->refresh, !running);
+    EnableWindow(app->deviceList, !running);
+
+    InvalidateRect(app->deviceList, nullptr, TRUE);
+    InvalidateStatus(app);
 }
 
-LRESULT HitTestWindow(AppState* app, HWND hwnd, LPARAM lParam) {
-    POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+// ############################
+// Custom child window procedures
+// ############################
 
-    if (ScreenPointInWindow(app->themeButton, pt) ||
-        ScreenPointInWindow(app->minButton, pt) ||
-        ScreenPointInWindow(app->maxButton, pt) ||
-        ScreenPointInWindow(app->closeButton, pt)) {
-        return HTCLIENT;
-    }
-
-    RECT wr;
-    GetWindowRect(hwnd, &wr);
-    if (!IsZoomed(hwnd)) {
-        bool left = pt.x >= wr.left && pt.x < wr.left + kResizeBorder;
-        bool right = pt.x < wr.right && pt.x >= wr.right - kResizeBorder;
-        bool top = pt.y >= wr.top && pt.y < wr.top + kResizeBorder;
-        bool bottom = pt.y < wr.bottom && pt.y >= wr.bottom - kResizeBorder;
-
-        if (top && left) return HTTOPLEFT;
-        if (top && right) return HTTOPRIGHT;
-        if (bottom && left) return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-        if (left) return HTLEFT;
-        if (right) return HTRIGHT;
-        if (top) return HTTOP;
-        if (bottom) return HTBOTTOM;
-    }
-
-    POINT client = pt;
-    ScreenToClient(hwnd, &client);
-    if (client.y >= 0 && client.y < kTitleBarHeight) {
-        return HTCAPTION;
-    }
-    return HTCLIENT;
-}
-
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    auto* app = reinterpret_cast<AppState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+LRESULT CALLBACK DeviceListProc(HWND hwnd, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    HWND parent = GetParent(hwnd);
+    auto* app = reinterpret_cast<AppState*>(
+        GetWindowLongPtrW(parent, GWLP_USERDATA));
 
     switch (message) {
-    case WM_NCHITTEST:
+    case WM_PAINT: {
+        PAINTSTRUCT paint = {};
+        HDC dc = BeginPaint(hwnd, &paint);
+
         if (app) {
-            return HitTestWindow(app, hwnd, lParam);
+            PaintBuffered(hwnd, dc, [app](HDC memoryDc) {
+                DrawDeviceList(app, memoryDc);
+            });
+        }
+
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        if (app) {
+            UpdateDeviceScrollBar(app);
+        }
+        return 0;
+    case WM_ENABLE:
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (app && app->deviceThumbDragging) {
+            RECT client = {};
+            GetClientRect(hwnd, &client);
+
+            int contentHeight = DeviceContentHeight(app);
+            int pageHeight = RectHeight(client);
+            int trackInset = Scale(app, 4);
+            int trackHeight = std::max(1, pageHeight - trackInset * 2);
+            int thumbHeight = RectHeight(DeviceThumbRect(app));
+            int thumbTravel = std::max(1, trackHeight - thumbHeight);
+            int maxScroll = std::max(1, contentHeight - pageHeight);
+            int y = GET_Y_LPARAM(lParam) - app->deviceThumbDragOffset;
+            int trackTop = client.top + trackInset;
+            int next = MulDiv(y - trackTop, maxScroll, thumbTravel);
+
+            SetDeviceScroll(app, next);
+            return 0;
+        }
+
+        if (app && IsWindowEnabled(hwnd)) {
+            int index = DeviceIndexFromPoint(app, GET_Y_LPARAM(lParam));
+
+            if (index != app->hotDeviceIndex) {
+                app->hotDeviceIndex = index;
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
+
+            TRACKMOUSEEVENT event = {};
+            event.cbSize = sizeof(event);
+            event.dwFlags = TME_LEAVE;
+            event.hwndTrack = hwnd;
+            TrackMouseEvent(&event);
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (app && !app->deviceThumbDragging) {
+            app->hotDeviceIndex = -1;
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+        SetFocus(hwnd);
+        if (app && IsWindowEnabled(hwnd)) {
+            POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            RECT thumb = DeviceThumbRect(app);
+
+            if (!IsRectEmpty(&thumb) && PtInRect(&thumb, point)) {
+                app->deviceThumbDragging = true;
+                app->deviceThumbDragOffset = point.y - thumb.top;
+                SetCapture(hwnd);
+                return 0;
+            }
+
+            if (!IsRectEmpty(&thumb) &&
+                point.x >= thumb.left - Scale(app, 3)) {
+                int direction = point.y < thumb.top ? -1 : 1;
+                RECT client = {};
+                GetClientRect(hwnd, &client);
+                SetDeviceScroll(app, app->deviceScroll +
+                    direction * RectHeight(client));
+                return 0;
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (app && app->deviceThumbDragging) {
+            app->deviceThumbDragging = false;
+            ReleaseCapture();
+            return 0;
+        }
+
+        if (app && IsWindowEnabled(hwnd)) {
+            int index = DeviceIndexFromPoint(app, GET_Y_LPARAM(lParam));
+            ToggleDevice(app, index);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (app) {
+            app->deviceThumbDragging = false;
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (app) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int steps = delta / WHEEL_DELTA;
+
+            if (steps == 0 && delta != 0) {
+                steps = delta > 0 ? 1 : -1;
+            }
+
+            SetDeviceScroll(app, app->deviceScroll - steps * 42);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (app && !app->devices.empty()) {
+            int lastIndex = static_cast<int>(app->devices.size()) - 1;
+            int next = app->focusDeviceIndex;
+
+            if (next < 0) {
+                next = 0;
+            }
+
+            if (wParam == VK_DOWN) {
+                next = std::min(lastIndex, next + 1);
+            } else if (wParam == VK_UP) {
+                next = std::max(0, next - 1);
+            } else if (wParam == VK_HOME) {
+                next = 0;
+            } else if (wParam == VK_END) {
+                next = lastIndex;
+            } else if (wParam == VK_SPACE) {
+                ToggleDevice(app, next);
+                return 0;
+            } else {
+                break;
+            }
+
+            app->focusDeviceIndex = next;
+            EnsureDeviceVisible(app, next);
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
         }
         break;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    default:
+        break;
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK StatusPanelProc(HWND hwnd, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    HWND parent = GetParent(hwnd);
+    auto* app = reinterpret_cast<AppState*>(
+        GetWindowLongPtrW(parent, GWLP_USERDATA));
+
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT paint = {};
+        HDC dc = BeginPaint(hwnd, &paint);
+
+        if (app) {
+            PaintBuffered(hwnd, dc, [app](HDC memoryDc) {
+                DrawStatusPanel(app, memoryDc);
+            });
+        }
+
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_LBUTTONDOWN:
+        if (app && app->volumeAvailable) {
+            POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+            if (PointInVolumeSlider(app, point)) {
+                app->volumeDragging = true;
+                SetCapture(hwnd);
+                SetSystemVolumeFromPoint(app, point.x);
+                return 0;
+            }
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (app && app->volumeDragging) {
+            SetSystemVolumeFromPoint(app, GET_X_LPARAM(lParam));
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (app && app->volumeDragging) {
+            app->volumeDragging = false;
+            ReleaseCapture();
+            SetSystemVolumeFromPoint(app, GET_X_LPARAM(lParam));
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (app) {
+            app->volumeDragging = false;
+        }
+        return 0;
+    default:
+        break;
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+// ############################
+// Main window procedure
+// ############################
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam,
+    LPARAM lParam) {
+    auto* app = reinterpret_cast<AppState*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    switch (message) {
     case WM_CREATE: {
         auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
         app = reinterpret_cast<AppState*>(create->lpCreateParams);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
         app->hwnd = hwnd;
+        app->dpi = GetDpiForWindow(hwnd);
 
-        app->title = CreateWindowW(L"STATIC", L"MultiTap", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTitleLabel)), GetModuleHandleW(nullptr), nullptr);
-        app->subtitle = CreateWindowW(L"STATIC", L"Duplicate system audio to selected playback devices.", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSubtitleLabel)), GetModuleHandleW(nullptr), nullptr);
-        app->themeButton = CreateWindowW(L"BUTTON", L"Dark", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kThemeButton)), GetModuleHandleW(nullptr), nullptr);
-        app->minButton = CreateWindowW(L"BUTTON", L"_", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMinButton)), GetModuleHandleW(nullptr), nullptr);
-        app->maxButton = CreateWindowW(L"BUTTON", L"[]", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMaxButton)), GetModuleHandleW(nullptr), nullptr);
-        app->closeButton = CreateWindowW(L"BUTTON", L"X", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCloseButton)), GetModuleHandleW(nullptr), nullptr);
+        app->title = CreateWindowW(L"STATIC", L"MultiTap",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT, 0, 0, 0, 0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTitleLabel)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->subtitle = CreateWindowW(L"STATIC",
+            L"Play system audio through multiple output devices at once.",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT, 0, 0, 0, 0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSubtitleLabel)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->themeButton = CreateWindowW(L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | BS_OWNERDRAW |
+            WS_TABSTOP,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kThemeButton)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->deviceHeading = CreateWindowW(L"STATIC", L"Output devices",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_LEFT, 0, 0, 0, 0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDeviceHeading)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->deviceList = CreateWindowExW(0, L"MultiTapDeviceList", L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDeviceList)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->start = CreateWindowW(L"BUTTON", L"Start",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | BS_OWNERDRAW |
+            WS_TABSTOP,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStartButton)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->stop = CreateWindowW(L"BUTTON", L"Stop",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | BS_OWNERDRAW |
+            WS_TABSTOP,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStopButton)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->refresh = CreateWindowW(L"BUTTON", L"Refresh",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | BS_OWNERDRAW |
+            WS_TABSTOP,
+            0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefreshButton)),
+            GetModuleHandleW(nullptr), nullptr);
+        app->statusPanel = CreateWindowExW(0, L"MultiTapStatusPanel", L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStatusPanel)),
+            GetModuleHandleW(nullptr), nullptr);
 
-        app->list = CreateWindowExW(0, WC_LISTVIEWW, L"",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDeviceList)), GetModuleHandleW(nullptr), nullptr);
-        ListView_SetExtendedListViewStyle(app->list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-
-        LVCOLUMNW column = {};
-        column.mask = LVCF_TEXT | LVCF_WIDTH;
-        column.pszText = const_cast<wchar_t*>(L"Playback devices");
-        column.cx = 500;
-        ListView_InsertColumn(app->list, 0, &column);
-
-        LVCOLUMNW volumeColumn = {};
-        volumeColumn.mask = LVCF_TEXT | LVCF_WIDTH;
-        volumeColumn.pszText = const_cast<wchar_t*>(L"Volume");
-        volumeColumn.cx = 90;
-        ListView_InsertColumn(app->list, 1, &volumeColumn);
-
-        app->start = CreateWindowW(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStartButton)), GetModuleHandleW(nullptr), nullptr);
-        app->stop = CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kStopButton)), GetModuleHandleW(nullptr), nullptr);
-        app->refresh = CreateWindowW(L"BUTTON", L"Refresh devices", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kRefreshButton)), GetModuleHandleW(nullptr), nullptr);
-        app->volumeLabel = CreateWindowW(L"STATIC", L"Selected ratio: -", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kVolumeLabel)), GetModuleHandleW(nullptr), nullptr);
-        app->volumeSlider = CreateWindowW(L"MultiTapSlider", L"", WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kVolumeSlider)), GetModuleHandleW(nullptr), nullptr);
-        SetSliderValue(app->volumeSlider, 100);
-        app->status = CreateWindowW(L"STATIC", L"Idle", WS_CHILD | WS_VISIBLE | SS_LEFT,
-            0, 0, 0, 0, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-
-        app->titleFont = MakeFont(18, FW_SEMIBOLD);
-        app->bodyFont = MakeFont(9, FW_NORMAL);
-        SendMessageW(app->title, WM_SETFONT, reinterpret_cast<WPARAM>(app->titleFont), TRUE);
-        SendMessageW(app->subtitle, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->themeButton, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->minButton, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->maxButton, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->closeButton, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->list, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->start, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->stop, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->refresh, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->volumeLabel, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
-        SendMessageW(app->status, WM_SETFONT, reinterpret_cast<WPARAM>(app->bodyFont), TRUE);
+        RebuildFonts(app);
 
         ApplyTheme(app);
         RefreshDevices(app);
         Resize(app);
         return 0;
     }
+    case WM_GETMINMAXINFO:
+        if (lParam) {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            UINT dpi = app ? app->dpi : GetDpiForSystem();
+            info->ptMinTrackSize.x = ScaleForDpi(kMinimumWindowWidth, dpi);
+            info->ptMinTrackSize.y = ScaleForDpi(kMinimumWindowHeight, dpi);
+        }
+        return 0;
+    case WM_DPICHANGED:
+        if (app) {
+            app->dpi = HIWORD(wParam);
+            RebuildFonts(app);
+
+            auto* suggested = reinterpret_cast<RECT*>(lParam);
+
+            if (suggested) {
+                SetWindowPos(hwnd, nullptr, suggested->left,
+                    suggested->top, RectWidth(*suggested),
+                    RectHeight(*suggested), SWP_NOZORDER |
+                    SWP_NOACTIVATE);
+            }
+
+            Resize(app);
+            RedrawWholeWindow(app);
+        }
+        return 0;
     case WM_SIZE:
         if (app) {
             Resize(app);
@@ -719,6 +1916,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (!app) {
             break;
         }
+
         switch (LOWORD(wParam)) {
         case kStartButton:
             Start(app);
@@ -733,15 +1931,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             app->dark = !app->dark;
             ApplyTheme(app);
             return 0;
-        case kMinButton:
-            ShowWindow(hwnd, SW_MINIMIZE);
-            return 0;
-        case kMaxButton:
-            ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
-            return 0;
-        case kCloseButton:
-            SendMessageW(hwnd, WM_CLOSE, 0, 0);
-            return 0;
         default:
             break;
         }
@@ -750,15 +1939,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (app) {
             HDC dc = reinterpret_cast<HDC>(wParam);
             HWND control = reinterpret_cast<HWND>(lParam);
-            const auto& theme = CurrentTheme(app);
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, control == app->subtitle || control == app->status ? theme.muted : theme.text);
-            return reinterpret_cast<LRESULT>(app->useBackdrop ? GetStockObject(NULL_BRUSH) : app->windowBrush);
+            const Theme& theme = CurrentTheme(app);
+
+            SetBkMode(dc, OPAQUE);
+            SetBkColor(dc, theme.background);
+
+            if (control == app->subtitle) {
+                SetTextColor(dc, theme.textMuted);
+            } else {
+                SetTextColor(dc, theme.text);
+            }
+
+            return reinterpret_cast<LRESULT>(app->windowBrush);
         }
         break;
     case WM_DRAWITEM:
         if (app) {
             auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+
             if (item && item->CtlType == ODT_BUTTON) {
                 DrawModernButton(app, item);
                 return TRUE;
@@ -767,46 +1965,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         break;
     case WM_ERASEBKGND:
         if (app) {
-            if (app->useBackdrop) {
-                return 1;
-            }
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            FillRect(reinterpret_cast<HDC>(wParam), &rc, app->windowBrush);
+            RECT rect = {};
+            GetClientRect(hwnd, &rect);
+            FillRect(reinterpret_cast<HDC>(wParam), &rect,
+                app->windowBrush);
             return 1;
-        }
-        break;
-    case kSliderChangedMessage:
-        if (app && reinterpret_cast<HWND>(lParam) == app->volumeSlider) {
-            int index = SelectedIndex(app);
-            if (index >= 0 && index < static_cast<int>(app->devices.size()) && !app->devices[static_cast<size_t>(index)].isDefault) {
-                int volume = static_cast<int>(wParam);
-                app->volumes[static_cast<size_t>(index)] = volume;
-                SetVolumeCell(app, index);
-                UpdateVolumeControls(app);
-                app->engine.SetDeviceVolume(app->devices[static_cast<size_t>(index)].id, static_cast<float>(volume) / 100.0f);
-                SaveCurrentDeviceConfigs(app);
-            }
-        }
-        return 0;
-    case WM_NOTIFY:
-        if (app) {
-            auto* hdr = reinterpret_cast<NMHDR*>(lParam);
-            if (hdr->idFrom == kDeviceList && hdr->code == LVN_ITEMCHANGED) {
-                UpdateButtons(app);
-                if (!app->engine.IsRunning()) {
-                    SaveCurrentDeviceConfigs(app);
-                }
-            }
         }
         break;
     case kStatusMessage:
         if (app) {
-            std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
+            std::unique_ptr<std::wstring> text(
+                reinterpret_cast<std::wstring*>(lParam));
             SetStatus(app, *text);
-            if (*text != L"Running" && *text != L"Starting...") {
-                UpdateButtons(app);
-            }
+            UpdateButtons(app);
+        }
+        return 0;
+    case kVolumeChangedMessage:
+        if (app) {
+            app->systemVolumePercent = std::clamp(
+                static_cast<int>(wParam), 0, 100);
+            app->volumeAvailable = true;
+            InvalidateStatus(app);
         }
         return 0;
     case WM_CLOSE:
@@ -817,12 +1996,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_DESTROY:
         if (app) {
-            if (app->titleFont) {
-                DeleteObject(app->titleFont);
+            if (app->volumeController) {
+                app->volumeController->Close();
             }
-            if (app->bodyFont) {
-                DeleteObject(app->bodyFont);
-            }
+
+            ReleaseFontObject(app->titleFont);
+            ReleaseFontObject(app->headingFont);
+            ReleaseFontObject(app->bodyFont);
+            ReleaseFontObject(app->smallFont);
+
             if (app->windowBrush) {
                 DeleteObject(app->windowBrush);
             }
@@ -830,47 +2012,79 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 DeleteObject(app->surfaceBrush);
             }
         }
+
         PostQuitMessage(0);
         return 0;
     default:
         break;
     }
+
     return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+void EnableDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+
+    if (user32) {
+        using SetContextProc = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+        auto setContext = reinterpret_cast<SetContextProc>(
+            GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+
+        if (setContext &&
+            setContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+            return;
+        }
+    }
+
+    SetProcessDPIAware();
 }
 
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    EnableDpiAwareness();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    INITCOMMONCONTROLSEX icc = {};
-    icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
-    InitCommonControlsEx(&icc);
+    INITCOMMONCONTROLSEX controls = {};
+    controls.dwSize = sizeof(controls);
+    controls.dwICC = ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&controls);
 
-    const wchar_t* className = L"MultiTapWindow";
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WindowProc;
-    wc.hInstance = instance;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = nullptr;
-    wc.lpszClassName = className;
+    const wchar_t* windowClassName = L"MultiTapWindow";
+    WNDCLASSW windowClass = {};
+    windowClass.lpfnWndProc = WindowProc;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = nullptr;
+    windowClass.lpszClassName = windowClassName;
+    windowClass.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassW(&windowClass);
 
-    RegisterClassW(&wc);
+    WNDCLASSW deviceListClass = {};
+    deviceListClass.lpfnWndProc = DeviceListProc;
+    deviceListClass.hInstance = instance;
+    deviceListClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
+    deviceListClass.hbrBackground = nullptr;
+    deviceListClass.lpszClassName = L"MultiTapDeviceList";
+    deviceListClass.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassW(&deviceListClass);
 
-    WNDCLASSW sliderClass = {};
-    sliderClass.lpfnWndProc = SliderProc;
-    sliderClass.hInstance = instance;
-    sliderClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
-    sliderClass.hbrBackground = nullptr;
-    sliderClass.lpszClassName = L"MultiTapSlider";
-    RegisterClassW(&sliderClass);
+    WNDCLASSW statusPanelClass = {};
+    statusPanelClass.lpfnWndProc = StatusPanelProc;
+    statusPanelClass.hInstance = instance;
+    statusPanelClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    statusPanelClass.hbrBackground = nullptr;
+    statusPanelClass.lpszClassName = L"MultiTapStatusPanel";
+    statusPanelClass.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassW(&statusPanelClass);
 
     AppState app;
-    DWORD style = WS_OVERLAPPED | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
-    HWND hwnd = CreateWindowExW(0, className, L"MultiTap",
-        style,
-        CW_USEDEFAULT, CW_USEDEFAULT, 660, 460,
+    UINT dpi = GetDpiForSystem();
+    int windowWidth = ScaleForDpi(kDefaultWindowWidth, dpi);
+    int windowHeight = ScaleForDpi(kDefaultWindowHeight, dpi);
+    HWND hwnd = CreateWindowExW(0, windowClassName, L"MultiTap",
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        CW_USEDEFAULT, CW_USEDEFAULT, windowWidth, windowHeight,
         nullptr, nullptr, instance, &app);
 
     if (!hwnd) {
@@ -881,12 +2095,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     ShowWindow(hwnd, showCommand);
     UpdateWindow(hwnd);
 
-    MSG msg = {};
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    MSG message = {};
+
+    while (GetMessageW(&message, nullptr, 0, 0)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
     }
 
     CoUninitialize();
-    return static_cast<int>(msg.wParam);
+    return static_cast<int>(message.wParam);
 }

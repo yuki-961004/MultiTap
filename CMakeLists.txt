@@ -42,5 +42,5 @@ target_link_libraries(MultiTap PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(MultiTap PRIVATE /W4 /permissive-)
+    target_compile_options(MultiTap PRIVATE /W4 /permissive- /utf-8)
 endif()
