@@ -31,7 +31,8 @@ std::wstring DeviceName(IMMDevice* device) {
     PROPVARIANT value;
     PropVariantInit(&value);
     std::wstring name = L"Unknown playback device";
-    if (SUCCEEDED(store->GetValue(kPKEYDeviceFriendlyName, &value)) && value.vt == VT_LPWSTR && value.pwszVal) {
+    if (SUCCEEDED(store->GetValue(kPKEYDeviceFriendlyName, &value)) &&
+        value.vt == VT_LPWSTR && value.pwszVal) {
         name = value.pwszVal;
     }
     PropVariantClear(&value);
@@ -120,13 +121,6 @@ std::vector<PlaybackDeviceInfo> EnumeratePlaybackDevices(std::wstring* error) {
         info.isDefault = !defaultId.empty() && info.id == defaultId;
         devices.push_back(std::move(info));
     }
-
-    std::sort(devices.begin(), devices.end(), [](const auto& a, const auto& b) {
-        if (a.isDefault != b.isDefault) {
-            return a.isDefault;
-        }
-        return a.name < b.name;
-    });
 
     return devices;
 }

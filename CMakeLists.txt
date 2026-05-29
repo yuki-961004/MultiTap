@@ -13,6 +13,7 @@ add_executable(MultiTap WIN32
     src/AudioEngine.cpp
     src/DeviceEnumerator.cpp
     src/Config.cpp
+    src/MultiTap.rc
 )
 
 add_custom_command(TARGET MultiTap POST_BUILD

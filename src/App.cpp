@@ -1,4 +1,4 @@
-#include "AudioEngine.h"
+﻿#include "AudioEngine.h"
 #include "ComPtr.h"
 #include "Config.h"
 #include "DeviceEnumerator.h"
@@ -46,6 +46,7 @@ constexpr int kDefaultWindowWidth = 640;
 constexpr int kDefaultWindowHeight = 520;
 constexpr int kMinimumWindowWidth = 560;
 constexpr int kMinimumWindowHeight = 420;
+constexpr int kDeviceRatioMaxPercent = 150;
 
 constexpr int kDeviceRowHeight = 56;
 constexpr int kDeviceRowGap = 8;
@@ -312,6 +313,7 @@ struct AppState {
     std::unique_ptr<SystemVolumeController> volumeController;
     std::vector<PlaybackDeviceInfo> devices;
     std::vector<bool> selected;
+    std::vector<int> deviceRatios;
     AudioEngine engine;
 
     UINT dpi = 96;
@@ -323,6 +325,8 @@ struct AppState {
     int focusDeviceIndex = -1;
     bool deviceThumbDragging = false;
     int deviceThumbDragOffset = 0;
+    int activeDeviceSliderIndex = -1;
+    bool deviceSliderDragging = false;
     bool volumeAvailable = false;
     bool volumeDragging = false;
     int systemVolumePercent = 100;
@@ -574,6 +578,42 @@ int SelectedDeviceCount(AppState* app) {
     return count;
 }
 
+int DeviceRatioPercent(AppState* app, size_t index) {
+    if (!app || index >= app->deviceRatios.size()) {
+        return 100;
+    }
+
+    return std::clamp(app->deviceRatios[index], 0, kDeviceRatioMaxPercent);
+}
+
+void SetDeviceRatioPercent(AppState* app, int index, int percent,
+    bool saveConfig) {
+    if (!app || index < 0 ||
+        index >= static_cast<int>(app->devices.size())) {
+        return;
+    }
+
+    int next = std::clamp(percent, 0, kDeviceRatioMaxPercent);
+    if (index >= static_cast<int>(app->deviceRatios.size())) {
+        app->deviceRatios.resize(app->devices.size(), 100);
+    }
+
+    app->deviceRatios[static_cast<size_t>(index)] = next;
+
+    if (app->engine.IsRunning()) {
+        app->engine.SetDeviceVolume(app->devices[static_cast<size_t>(index)].id,
+            static_cast<float>(next) / 100.0f);
+    }
+
+    if (saveConfig) {
+        SaveCurrentDeviceConfigs(app);
+    }
+
+    if (app->deviceList) {
+        InvalidateRect(app->deviceList, nullptr, TRUE);
+    }
+}
+
 bool HasSelectedBluetooth(AppState* app) {
     // 只有被选中的蓝牙设备才需要提示用户可能存在延迟.
     for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
@@ -603,11 +643,18 @@ std::vector<std::wstring> CheckedDeviceIds(AppState* app) {
 std::vector<OutputSelection> CheckedDevices(AppState* app) {
     std::vector<OutputSelection> devices;
 
-    // UI 已隐藏高级音量比例, 所以每个输出都使用 100% 的直观默认值.
+    // 每个输出都带上自己的相对比例, 这样系统音量变化时会一起缩放.
     for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
          ++i) {
         if (app->selected[i]) {
-            devices.push_back({ app->devices[i].id, 1.0f });
+            int percent = i < app->deviceRatios.size()
+                ? app->deviceRatios[i]
+                : 100;
+            devices.push_back({
+                app->devices[i].id,
+                std::clamp(static_cast<float>(percent) / 100.0f, 0.0f,
+                    static_cast<float>(kDeviceRatioMaxPercent) / 100.0f)
+            });
         }
     }
 
@@ -617,10 +664,18 @@ std::vector<OutputSelection> CheckedDevices(AppState* app) {
 std::vector<DeviceConfig> CurrentDeviceConfigs(AppState* app) {
     std::vector<DeviceConfig> configs;
 
-    // 配置仍然写回同一格式, 但不再暴露隐藏的比例滑杆.
+    // 配置仍然写回同一格式, 只是 volume 现在代表相对比例.
     for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
          ++i) {
-        configs.push_back({ app->devices[i].id, app->selected[i], 1.0f });
+        int percent = i < app->deviceRatios.size()
+            ? app->deviceRatios[i]
+            : 100;
+        configs.push_back({
+            app->devices[i].id,
+            app->selected[i],
+            std::clamp(static_cast<float>(percent) / 100.0f, 0.0f,
+                static_cast<float>(kDeviceRatioMaxPercent) / 100.0f)
+        });
     }
 
     return configs;
@@ -628,6 +683,43 @@ std::vector<DeviceConfig> CurrentDeviceConfigs(AppState* app) {
 
 void SaveCurrentDeviceConfigs(AppState* app) {
     SaveDeviceConfigs(CurrentDeviceConfigs(app));
+}
+
+void PromoteSelectedDevices(AppState* app) {
+    if (!app) {
+        return;
+    }
+
+    std::vector<PlaybackDeviceInfo> orderedDevices;
+    std::vector<bool> orderedSelected;
+    std::vector<int> orderedRatios;
+    orderedDevices.reserve(app->devices.size());
+    orderedSelected.reserve(app->selected.size());
+    orderedRatios.reserve(app->deviceRatios.size());
+
+    for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
+         ++i) {
+        if (app->selected[i]) {
+            orderedDevices.push_back(app->devices[i]);
+            orderedSelected.push_back(true);
+            orderedRatios.push_back(
+                i < app->deviceRatios.size() ? app->deviceRatios[i] : 100);
+        }
+    }
+
+    for (size_t i = 0; i < app->devices.size() && i < app->selected.size();
+         ++i) {
+        if (!app->selected[i]) {
+            orderedDevices.push_back(app->devices[i]);
+            orderedSelected.push_back(false);
+            orderedRatios.push_back(
+                i < app->deviceRatios.size() ? app->deviceRatios[i] : 100);
+        }
+    }
+
+    app->devices = std::move(orderedDevices);
+    app->selected = std::move(orderedSelected);
+    app->deviceRatios = std::move(orderedRatios);
 }
 
 // ############################
@@ -704,7 +796,11 @@ void SetStatus(AppState* app, const std::wstring& text) {
 // ############################
 
 int DeviceRowHeight(AppState* app) {
-    return Scale(app, kDeviceRowHeight);
+    return Scale(app, 84);
+}
+
+int DeviceRowExpandedHeight(AppState* app) {
+    return Scale(app, 140);
 }
 
 int DeviceRowGap(AppState* app) {
@@ -720,9 +816,19 @@ int DeviceContentHeight(AppState* app) {
         return 0;
     }
 
-    int count = static_cast<int>(app->devices.size());
-    return count * DeviceRowHeight(app) + (count - 1) *
-        DeviceRowGap(app);
+    int total = 0;
+
+    for (size_t i = 0; i < app->devices.size(); ++i) {
+        total += app->selected.size() > i && app->selected[i]
+            ? DeviceRowExpandedHeight(app)
+            : DeviceRowHeight(app);
+
+        if (i + 1 < app->devices.size()) {
+            total += DeviceRowGap(app);
+        }
+    }
+
+    return total;
 }
 
 bool DeviceNeedsScroll(AppState* app) {
@@ -737,6 +843,32 @@ int MaxDeviceScroll(AppState* app) {
     GetClientRect(app->deviceList, &rect);
 
     return std::max(0, DeviceContentHeight(app) - RectHeight(rect));
+}
+
+int DeviceItemHeight(AppState* app, size_t index) {
+    if (index < app->selected.size() && app->selected[index]) {
+        return DeviceRowExpandedHeight(app);
+    }
+
+    return DeviceRowHeight(app);
+}
+
+int DeviceItemTop(AppState* app, size_t index) {
+    int top = 0;
+
+    for (size_t i = 0; i < index && i < app->devices.size(); ++i) {
+        top += DeviceItemHeight(app, i);
+
+        if (i + 1 <= index) {
+            top += DeviceRowGap(app);
+        }
+    }
+
+    return top;
+}
+
+int DeviceItemBottom(AppState* app, size_t index) {
+    return DeviceItemTop(app, index) + DeviceItemHeight(app, index);
 }
 
 void UpdateDeviceScrollBar(AppState* app) {
@@ -776,10 +908,8 @@ void EnsureDeviceVisible(AppState* app, int index) {
     RECT rect = {};
     GetClientRect(app->deviceList, &rect);
 
-    int rowHeight = DeviceRowHeight(app);
-    int stride = rowHeight + DeviceRowGap(app);
-    int itemTop = index * stride;
-    int itemBottom = itemTop + rowHeight;
+    int itemTop = DeviceItemTop(app, static_cast<size_t>(index));
+    int itemBottom = DeviceItemBottom(app, static_cast<size_t>(index));
 
     // 焦点行在可视区域上方时向上滚动.
     if (itemTop < app->deviceScroll) {
@@ -795,26 +925,93 @@ void EnsureDeviceVisible(AppState* app, int index) {
 
 int DeviceIndexFromPoint(AppState* app, int y) {
     int contentY = y + app->deviceScroll;
-    int rowHeight = DeviceRowHeight(app);
-    int stride = rowHeight + DeviceRowGap(app);
+    int top = 0;
 
-    if (contentY < 0 || stride <= 0) {
-        return -1;
+    for (size_t i = 0; i < app->devices.size(); ++i) {
+        int itemHeight = DeviceItemHeight(app, i);
+        int bottom = top + itemHeight;
+
+        if (contentY >= top && contentY < bottom) {
+            return static_cast<int>(i);
+        }
+
+        top = bottom + DeviceRowGap(app);
     }
 
-    int index = contentY / stride;
-    int offset = contentY % stride;
+    return -1;
+}
 
-    // 行间距区域不响应点击, 这样列表触感更像卡片而不是表格.
-    if (offset >= rowHeight) {
-        return -1;
+RECT DeviceItemRect(AppState* app, size_t index) {
+    RECT client = {};
+    GetClientRect(app->deviceList, &client);
+
+    int top = DeviceItemTop(app, index) - app->deviceScroll;
+    int height = DeviceItemHeight(app, index);
+
+    return RECT{
+        client.left + Scale(app, 1),
+        top,
+        client.right - Scale(app, 1),
+        top + height
+    };
+}
+
+RECT DeviceSliderTrackRect(AppState* app, size_t index) {
+    RECT row = DeviceItemRect(app, index);
+    int padding = Scale(app, 16);
+    int labelWidth = Scale(app, 128);
+    int sliderHeight = Scale(app, 6);
+    int trackTop = row.bottom - Scale(app, 28);
+
+    return RECT{
+        row.left + padding + labelWidth,
+        trackTop,
+        row.right - padding,
+        trackTop + sliderHeight
+    };
+}
+
+RECT DeviceSliderThumbRect(AppState* app, size_t index) {
+    RECT track = DeviceSliderTrackRect(app, index);
+    int thumbSize = Scale(app, 16);
+    int trackWidth = std::max(1, RectWidth(track));
+    int percent = DeviceRatioPercent(app, index);
+    int x = track.left + MulDiv(percent, trackWidth, kDeviceRatioMaxPercent);
+    int centerY = track.top + RectHeight(track) / 2;
+
+    return RECT{
+        x - thumbSize / 2,
+        centerY - thumbSize / 2,
+        x + thumbSize / 2,
+        centerY + thumbSize / 2
+    };
+}
+
+bool PointInDeviceSlider(AppState* app, int index, POINT point) {
+    RECT track = DeviceSliderTrackRect(app, static_cast<size_t>(index));
+    RECT thumb = DeviceSliderThumbRect(app, static_cast<size_t>(index));
+    InflateRect(&track, Scale(app, 6), Scale(app, 12));
+    InflateRect(&thumb, Scale(app, 4), Scale(app, 4));
+    return PtInRect(&track, point) || PtInRect(&thumb, point);
+}
+
+int DeviceRatioPercentFromX(AppState* app, size_t index, int x) {
+    RECT track = DeviceSliderTrackRect(app, index);
+    int trackLeft = static_cast<int>(track.left);
+    int trackRight = static_cast<int>(track.right);
+    int width = std::max(1, trackRight - trackLeft);
+    int clampedX = std::clamp(x, trackLeft, trackRight);
+    return std::clamp(MulDiv(clampedX - trackLeft, kDeviceRatioMaxPercent,
+        width), 0, kDeviceRatioMaxPercent);
+}
+
+void UpdateDeviceSliderFromPoint(AppState* app, int index, int x) {
+    if (!app || index < 0) {
+        return;
     }
 
-    if (index < 0 || index >= static_cast<int>(app->devices.size())) {
-        return -1;
-    }
-
-    return index;
+    int percent = DeviceRatioPercentFromX(app, static_cast<size_t>(index), x);
+    SetDeviceRatioPercent(app, index, percent, true);
 }
 
 RECT DeviceThumbRect(AppState* app) {
@@ -935,6 +1132,41 @@ void DrawDevicePill(HDC dc, AppState* app, const std::wstring& text,
     SelectObject(dc, oldFont);
 }
 
+void DrawRatioSlider(AppState* app, HDC dc, size_t index, RECT row,
+    bool enabled) {
+    const Theme& theme = CurrentTheme(app);
+    RECT track = DeviceSliderTrackRect(app, index);
+    RECT thumb = DeviceSliderThumbRect(app, index);
+    int percent = DeviceRatioPercent(app, index);
+
+    RECT label = {
+        row.left + Scale(app, 48),
+        track.top - Scale(app, 20),
+        row.left + Scale(app, 180),
+        track.top + Scale(app, 2)
+    };
+
+    std::wstring text = L"Relative volume: " +
+        std::to_wstring(percent) + L"%";
+
+    COLORREF labelColor = enabled ? theme.textMuted : theme.textDisabled;
+    DrawTextLine(dc, app->smallFont, labelColor, text, label,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    COLORREF rail = app->dark ? RGB(76, 79, 86) : RGB(217, 223, 230);
+    COLORREF fill = enabled ? theme.accent : theme.textDisabled;
+    COLORREF thumbFill = enabled ? (app->dark ? RGB(246, 247, 250) :
+        RGB(255, 255, 255)) : theme.buttonDisabled;
+
+    RECT fillRect = track;
+    fillRect.right = track.left + MulDiv(percent, RectWidth(track),
+        kDeviceRatioMaxPercent);
+
+    FillRoundedRect(dc, track, Scale(app, 4), rail, rail);
+    FillRoundedRect(dc, fillRect, Scale(app, 4), fill, fill);
+    FillRoundedRect(dc, thumb, Scale(app, 8), thumbFill, theme.accent);
+}
+
 void DrawDeviceList(AppState* app, HDC dc) {
     const Theme& theme = CurrentTheme(app);
     RECT client = {};
@@ -951,9 +1183,6 @@ void DrawDeviceList(AppState* app, HDC dc) {
     }
 
     bool enabled = IsWindowEnabled(app->deviceList) != FALSE;
-    int rowHeight = DeviceRowHeight(app);
-    int rowGap = DeviceRowGap(app);
-    int stride = rowHeight + rowGap;
     int rightInset = DeviceNeedsScroll(app) ? DeviceScrollbarWidth(app) : 0;
     int checkboxSize = Scale(app, 18);
     int checkboxLeft = Scale(app, 16);
@@ -961,32 +1190,25 @@ void DrawDeviceList(AppState* app, HDC dc) {
 
     // 只绘制可见行, 避免设备很多时产生无意义的 GDI 绘制.
     for (int i = 0; i < static_cast<int>(app->devices.size()); ++i) {
-        int y = i * stride - app->deviceScroll;
+        int index = static_cast<size_t>(i);
+        RECT row = DeviceItemRect(app, index);
 
-        if (y > client.bottom || y + rowHeight < client.top) {
+        if (row.top > client.bottom || row.bottom < client.top) {
             continue;
         }
 
-        RECT row = {
-            client.left + 1,
-            y,
-            client.right - rightInset - 1,
-            y + rowHeight
-        };
-
-        if (RectWidth(row) < Scale(app, 160)) {
-            row.right = client.right - 1;
-        }
+        row.right -= rightInset;
 
         bool checked = i < static_cast<int>(app->selected.size()) &&
             app->selected[static_cast<size_t>(i)];
         bool hot = i == app->hotDeviceIndex && enabled;
         bool focused = i == app->focusDeviceIndex &&
             GetFocus() == app->deviceList;
+        bool sliderHot = i == app->activeDeviceSliderIndex;
 
         COLORREF fill = hot ? theme.surfaceHover : theme.surface;
         COLORREF border = checked ? theme.accent : theme.border;
-        int borderWidth = focused ? 2 : 1;
+        int borderWidth = focused || sliderHot ? 2 : 1;
 
         if (!enabled) {
             fill = theme.surface;
@@ -996,11 +1218,14 @@ void DrawDeviceList(AppState* app, HDC dc) {
         FillRoundedRect(dc, row, Scale(app, kCardRadius), fill, border,
             borderWidth);
 
+        int rowHeight = DeviceItemHeight(app, index);
+        int checkboxTop = row.top +
+            std::max(Scale(app, 18), (rowHeight - checkboxSize) / 2);
         RECT checkbox = {
             row.left + checkboxLeft,
-            row.top + (rowHeight - checkboxSize) / 2,
+            checkboxTop,
             row.left + checkboxLeft + checkboxSize,
-            row.top + (rowHeight + checkboxSize) / 2
+            checkboxTop + checkboxSize
         };
         DrawCheckbox(dc, checkbox, checked, enabled, theme);
 
@@ -1008,13 +1233,13 @@ void DrawDeviceList(AppState* app, HDC dc) {
         DrawDevicePill(dc, app, label, app->devices[i].isDefault, enabled,
             row);
 
-        int labelReserve = std::max(Scale(app, 118),
-            std::min(Scale(app, 172), RectWidth(row) / 3));
+        int labelReserve = std::max(Scale(app, 128),
+            std::min(Scale(app, 180), RectWidth(row) / 3));
         int nameHeight = FontLineHeight(app->deviceList, app->bodyFont) +
             Scale(app, 2);
         int detailHeight = FontLineHeight(app->deviceList, app->smallFont) +
             Scale(app, 1);
-        int textTop = row.top + (rowHeight - nameHeight - detailHeight) / 2;
+        int textTop = row.top + Scale(app, 12);
         int textRight = std::max(row.left + textLeft + Scale(app, 60),
             row.right - labelReserve - Scale(app, 20));
         RECT nameRect = {
@@ -1040,6 +1265,10 @@ void DrawDeviceList(AppState* app, HDC dc) {
         DrawTextLine(dc, app->smallFont, detailColor,
             DeviceDetailLabel(app->devices[i]), typeRect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        if (checked) {
+            DrawRatioSlider(app, dc, index, row, enabled);
+        }
     }
 
     DrawDeviceScrollbar(app, dc);
@@ -1071,43 +1300,37 @@ void ToggleDevice(AppState* app, int index) {
 void DrawThemeButton(AppState* app, const DRAWITEMSTRUCT* item) {
     const Theme& theme = CurrentTheme(app);
     RECT rect = item->rcItem;
+    bool disabled = (item->itemState & ODS_DISABLED) != 0;
+    bool pressed = (item->itemState & ODS_SELECTED) != 0;
+    bool focused = (item->itemState & ODS_FOCUS) != 0;
+    bool hovered = (item->itemState & ODS_HOTLIGHT) != 0;
 
     FillRect(item->hDC, &rect, app->windowBrush);
     InflateRect(&rect, -1, -1);
-    FillRoundedRect(item->hDC, rect, Scale(app, 8), theme.button,
-        theme.border);
 
-    int middle = rect.left + RectWidth(rect) / 2;
-    int inset = Scale(app, 2);
-    RECT lightRect = {
-        rect.left + inset,
-        rect.top + inset,
-        middle,
-        rect.bottom - inset
-    };
-    RECT darkRect = {
-        middle,
-        rect.top + inset,
-        rect.right - inset,
-        rect.bottom - inset
-    };
-    RECT selectedRect = app->dark ? darkRect : lightRect;
+    COLORREF fill = theme.button;
+    COLORREF border = theme.border;
+    if (pressed && !disabled) {
+        fill = theme.buttonPressed;
+    } else if (hovered && !disabled) {
+        fill = theme.surfaceHover;
+    }
 
-    FillRoundedRect(item->hDC, selectedRect, Scale(app, 7), theme.accentSoft,
-        theme.accent);
+    if (focused && !disabled) {
+        border = theme.accent;
+    }
 
-    HPEN separatorPen = CreatePen(PS_SOLID, 1, theme.border);
-    HGDIOBJ oldPen = SelectObject(item->hDC, separatorPen);
-    MoveToEx(item->hDC, middle, rect.top + Scale(app, 6), nullptr);
-    LineTo(item->hDC, middle, rect.bottom - Scale(app, 6));
-    SelectObject(item->hDC, oldPen);
-    DeleteObject(separatorPen);
+    if (disabled) {
+        fill = theme.buttonDisabled;
+        border = theme.border;
+    }
 
+    FillRoundedRect(item->hDC, rect, Scale(app, 10), fill, border);
+
+    std::wstring icon = app->dark ? L"\u263E" : L"\u2600";
+    RECT iconRect = rect;
     DrawTextLine(item->hDC, app->smallFont,
-        app->dark ? theme.textMuted : theme.accent, L"Light", lightRect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    DrawTextLine(item->hDC, app->smallFont,
-        app->dark ? theme.accent : theme.textMuted, L"Dark", darkRect,
+        disabled ? theme.textDisabled : theme.accent, icon, iconRect,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -1434,7 +1657,8 @@ void Resize(AppState* app) {
     int height = RectHeight(rect);
     int margin = Scale(app, 24);
     int top = Scale(app, 20);
-    int themeWidth = Scale(app, 124);
+    int themeWidth = std::max(Scale(app, 36),
+        FontLineHeight(app->hwnd, app->smallFont) + Scale(app, 14));
     int themeHeight = std::max(Scale(app, 32),
         FontLineHeight(app->hwnd, app->smallFont) + Scale(app, 14));
     int titleHeight = FontLineHeight(app->hwnd, app->titleFont) +
@@ -1490,28 +1714,43 @@ void Resize(AppState* app) {
 void RefreshDevices(AppState* app) {
     auto savedConfigs = LoadDeviceConfigs();
     auto previouslySelected = CheckedDeviceIds(app);
+    auto oldRatios = app->deviceRatios;
+    auto oldDevices = app->devices;
 
     std::wstring error;
     app->devices = EnumeratePlaybackDevices(&error);
     app->selected.assign(app->devices.size(), false);
+    app->deviceRatios.assign(app->devices.size(), 100);
     RefreshSystemVolume(app);
 
     for (size_t i = 0; i < app->devices.size(); ++i) {
         bool checked = std::find(previouslySelected.begin(),
             previouslySelected.end(), app->devices[i].id) !=
             previouslySelected.end();
+        int ratio = 100;
 
         // 如果当前没有临时选择, 就从配置文件恢复上次明确保存的选择.
         if (previouslySelected.empty()) {
             for (const auto& config : savedConfigs) {
                 if (config.id == app->devices[i].id) {
                     checked = config.selected;
+                    ratio = static_cast<int>(std::clamp(config.volume, 0.0f,
+                        static_cast<float>(kDeviceRatioMaxPercent) / 100.0f) *
+                        100.0f + 0.5f);
                     break;
                 }
             }
         }
 
+        for (size_t j = 0; j < oldDevices.size() && j < oldRatios.size(); ++j) {
+            if (app->devices[i].id == oldDevices[j].id) {
+                ratio = oldRatios[j];
+                break;
+            }
+        }
+
         app->selected[i] = checked;
+        app->deviceRatios[i] = std::clamp(ratio, 0, kDeviceRatioMaxPercent);
     }
 
     if (!error.empty()) {
@@ -1523,6 +1762,8 @@ void RefreshDevices(AppState* app) {
     app->deviceScroll = 0;
     app->hotDeviceIndex = -1;
     app->focusDeviceIndex = app->devices.empty() ? -1 : 0;
+    app->activeDeviceSliderIndex = -1;
+    app->deviceSliderDragging = false;
 
     UpdateDeviceScrollBar(app);
     UpdateButtons(app);
@@ -1552,7 +1793,11 @@ void Start(AppState* app) {
     if (!ok) {
         SetStatus(app, error);
     } else {
+        PromoteSelectedDevices(app);
+        app->focusDeviceIndex = app->selected.empty() ? -1 : 0;
+        app->deviceScroll = 0;
         SetStatus(app, L"Running");
+        InvalidateRect(app->deviceList, nullptr, TRUE);
     }
 
     UpdateButtons(app);
@@ -1613,6 +1858,12 @@ LRESULT CALLBACK DeviceListProc(HWND hwnd, UINT message, WPARAM wParam,
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
     case WM_MOUSEMOVE:
+        if (app && app->deviceSliderDragging) {
+            UpdateDeviceSliderFromPoint(app, app->activeDeviceSliderIndex,
+                GET_X_LPARAM(lParam));
+            return 0;
+        }
+
         if (app && app->deviceThumbDragging) {
             RECT client = {};
             GetClientRect(hwnd, &client);
@@ -1675,9 +1926,29 @@ LRESULT CALLBACK DeviceListProc(HWND hwnd, UINT message, WPARAM wParam,
                     direction * RectHeight(client));
                 return 0;
             }
+
+            int index = DeviceIndexFromPoint(app, point.y);
+            if (index >= 0 && index < static_cast<int>(app->devices.size()) &&
+                app->selected[static_cast<size_t>(index)] &&
+                PointInDeviceSlider(app, index, point)) {
+                app->deviceSliderDragging = true;
+                app->activeDeviceSliderIndex = index;
+                SetCapture(hwnd);
+                UpdateDeviceSliderFromPoint(app, index, point.x);
+                return 0;
+            }
         }
         return 0;
     case WM_LBUTTONUP:
+        if (app && app->deviceSliderDragging) {
+            UpdateDeviceSliderFromPoint(app, app->activeDeviceSliderIndex,
+                GET_X_LPARAM(lParam));
+            app->deviceSliderDragging = false;
+            app->activeDeviceSliderIndex = -1;
+            ReleaseCapture();
+            return 0;
+        }
+
         if (app && app->deviceThumbDragging) {
             app->deviceThumbDragging = false;
             ReleaseCapture();
@@ -1692,6 +1963,8 @@ LRESULT CALLBACK DeviceListProc(HWND hwnd, UINT message, WPARAM wParam,
     case WM_CAPTURECHANGED:
         if (app) {
             app->deviceThumbDragging = false;
+            app->deviceSliderDragging = false;
+            app->activeDeviceSliderIndex = -1;
         }
         return 0;
     case WM_MOUSEWHEEL:
